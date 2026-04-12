@@ -324,7 +324,39 @@ export default function App() {
   const [rdy, setRdy] = useState(false);
   const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkStatus, setBulkStatus] = useState("");
+  const [appState, setAppState] = useState("welcome"); // welcome | processing | confirmed | dashboard
+  const [processingMsg, setProcessingMsg] = useState("Processing");
   const fileRef = useRef();
+
+  const autoLookup = async (holdingsList) => {
+    let dot = 0;
+    const blink = setInterval(()=>{ dot=(dot+1)%4; setProcessingMsg("Processing"+".".repeat(dot)); }, 500);
+    let updated = [...holdingsList];
+    for (let i = 0; i < holdingsList.length; i++) {
+      const h = holdingsList[i];
+      await new Promise(res=>{
+        const timer = setTimeout(()=>res(), 30000);
+        aiLookup(h.ticker,
+          d=>{
+            clearTimeout(timer);
+            updated = updated.map(x=>x.id===h.id?{...x,...d,ticker:x.ticker,shares:x.shares,notes:""}:x);
+            res();
+          },
+          ()=>{ clearTimeout(timer); res(); },
+          ()=>{}
+        );
+      });
+      await new Promise(r=>setTimeout(r,300));
+    }
+    clearInterval(blink);
+    setHoldings(updated);
+    const problems = updated.filter(h=>!h.divPerShare||h.notes==="needs-lookup");
+    if (problems.length===0) {
+      setAppState("confirmed");
+    } else {
+      setAppState("dashboard");
+    }
+  };
 
   useEffect(()=>{
     (async()=>{
@@ -370,8 +402,10 @@ export default function App() {
       id:Date.now()+i, ticker:r.ticker, name:r.name||r.ticker,
       type:"stock", shares:r.shares, divPerShare:0, freqId:"q_mar", notes:"needs-lookup",
     }));
-    setHoldings(p=>[...p,...newH]);
+    setHoldings(newH);
     setImpModal(null);
+    setAppState("processing");
+    autoLookup(newH);
   };
 
   const bulkLookup = async () => {
@@ -417,7 +451,38 @@ export default function App() {
 
   if (!rdy) return <div style={{minHeight:"100vh",background:"#f1f5f9"}}/>;
 
-  if (holdings.length===0) return (
+  if (appState==="processing") return (
+    <>
+      <style>{CSS}</style>
+      <div className="welcome">
+        <div className="wicon">$</div>
+        <h1 className="wtitle">Dividend Finder</h1>
+        <div style={{marginTop:32,display:"flex",flexDirection:"column",alignItems:"center",gap:20}}>
+          <div style={{width:48,height:48,border:"4px solid #e2e8f0",borderTop:"4px solid #3b82f6",borderRadius:"50%",animation:"spin 1s linear infinite"}}/>
+          <div style={{fontFamily:"'DM Mono',monospace",fontSize:16,color:"#3b82f6",letterSpacing:".05em"}}>{processingMsg}</div>
+          <div style={{fontSize:13,color:"#94a3b8"}}>Looking up dividend data for all positions</div>
+        </div>
+        <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      </div>
+    </>
+  );
+
+  if (appState==="confirmed") return (
+    <>
+      <style>{CSS}</style>
+      <div className="welcome">
+        <div style={{fontSize:64,marginBottom:16}}>✅</div>
+        <h1 className="wtitle" style={{color:"#10b981"}}>All Symbols and Dividends Confirmed</h1>
+        <p className="wsub" style={{color:"#64748b",marginTop:8}}>{holdings.length} positions verified successfully</p>
+        <button className="wbtn-import" style={{marginTop:32,background:"#10b981",fontSize:16,padding:"16px 32px"}}
+          onClick={()=>setAppState("dashboard")}>
+          Click Here to see Income Calculation for your Portfolio
+        </button>
+      </div>
+    </>
+  );
+
+  if (holdings.length===0 || appState==="welcome") return (
     <>
       <style>{CSS}</style>
       <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={handleFile}/>
@@ -450,7 +515,7 @@ export default function App() {
             {bulkStatus&&<span className="bstat">{bulkStatus}</span>}
             <button className="ibtn" onClick={()=>fileRef.current&&fileRef.current.click()}>Import CSV</button>
             <button className="abtn" onClick={()=>setModal("add")}>+ Add</button>
-            <button className="rbtn" onClick={()=>{setHoldings([]);setView("dashboard");}}>Reset</button>
+            <button className="rbtn" onClick={()=>{setHoldings([]);setView("dashboard");setAppState("welcome");}}>Reset</button>
           </div>
         </header>
 
