@@ -1,6 +1,13 @@
-import { useState, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, AreaChart, Area, CartesianGrid } from "recharts";
 
-const API_BASE = 'https://dividend-api-production.up.railway.app';
+const SEC_TYPES = {
+  stock:     { label: "Equity Stock",     color: "#3b82f6", bg: "#3b82f615" },
+  reit:      { label: "Other",            color: "#8b5cf6", bg: "#8b5cf615" },
+  bond:      { label: "ETF",              color: "#06b6d4", bg: "#06b6d415" },
+  preferred: { label: "Preferred Stock",  color: "#10b981", bg: "#10b98115" },
+  cd:        { label: "Other",            color: "#f59e0b", bg: "#f59e0b15" },
+};
 
 const FREQ = [
   { id:"monthly",    label:"Monthly",                     months:[1,2,3,4,5,6,7,8,9,10,11,12] },
@@ -13,8 +20,13 @@ const FREQ = [
   { id:"annual_jun", label:"Annual (June)",                months:[6] },
 ];
 
+const MN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+
 const fmt = (n, d=0) => n == null ? "--" :
   new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",minimumFractionDigits:d,maximumFractionDigits:d}).format(n);
+
+const fmtDate = s => { if(!s) return null; const p=s.split('-'); return MN[+p[1]-1]+' '+p[2]; };
 
 const parseNum = s => parseFloat(String(s||"0").replace(/[$,%\s,"()]/g,"")) || 0;
 
@@ -57,344 +69,678 @@ function getShares(row) {
   return key ? row[key] : "0";
 }
 
-// Uses Railway — same endpoint as calculator bulk lookup
-async function fetchDividends(tickers) {
-  if (!Array.isArray(tickers) || tickers.length === 0) throw new Error('tickers must be a non-empty array');
-  const response = await fetch(`${API_BASE}/dividends`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tickers }),
-  });
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.error || `HTTP ${response.status}`);
-  }
-  return response.json();
+async function aiLookup(ticker, onResult, onError, onLoad) {
+  onLoad(true);
+  try {
+    const r = await fetch("https://dividend-api-production.up.railway.app/dividends", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ tickers: [ticker] }),
+    });
+    const d = await r.json();
+    if (d.errors?.length && !d.results?.length) throw new Error(d.errors[0].error);
+    const data = d.results?.[0];
+    if (!data) throw new Error("No data returned");
+    onResult({
+      divPerShare: data.dividend_per_payment ?? (data.dividend_per_share != null && data.payment_frequency ? +(data.dividend_per_share / data.payment_frequency).toFixed(4) : 0),
+      freqId: data.freqId ?? "q_mar",
+      ...(data.sec_type ? { type: data.sec_type } : {}),
+      ...(data.price != null ? { price: data.price } : {}),
+      ...(data.last_payment_date ? { lastPaymentDate: data.last_payment_date } : {}),
+      ...(data.note ? { notes: data.note } : {}),
+    });
+  } catch(e) { onError(e.message||"Failed"); }
+  finally { onLoad(false); }
 }
 
-function getCandidates(ticker) {
-  const t = ticker.toUpperCase();
-  const candidates = new Set();
-  if (t.endsWith("/PR")) { candidates.add(t.slice(0,-3)); candidates.add(t.slice(0,-3)+"P"); }
-  if (t.endsWith("-PR")) { candidates.add(t.slice(0,-3)); candidates.add(t.slice(0,-3)+"P"); }
-  if (t.includes("/")) candidates.add(t.replace("/","-"));
-  if (t.includes("-")) candidates.add(t.replace("-","/"));
-  const base = t.replace(/[/-]PR$/,"").replace(/[/-]P[A-Z]?$/,"");
-  ["P","PA","PB","PC"].forEach(s => candidates.add(base+s));
-  candidates.add(base);
-  candidates.delete(t);
-  return [...candidates].filter(Boolean);
+function calcMonthly(holdings) {
+  const t = Array(12).fill(0);
+  holdings.forEach(h => {
+    const f = FREQ.find(f=>f.id===h.freqId)||FREQ[0];
+    f.months.forEach(m => { t[m-1] += (h.shares||0)*(h.divPerShare||0); });
+  });
+  return t;
+}
+
+function calcTypes(holdings) {
+  const map = {};
+  holdings.forEach(h => {
+    const f = FREQ.find(f=>f.id===h.freqId)||FREQ[0];
+    const a = (h.shares||0)*(h.divPerShare||0)*f.months.length;
+    map[h.type] = (map[h.type]||0)+a;
+  });
+  return Object.entries(map).map(([type,value])=>({
+    type,value,label:SEC_TYPES[type]?.label||type,color:SEC_TYPES[type]?.color
+  })).filter(d=>d.value>0).sort((a,b)=>b.value-a.value);
+}
+
+function HoldingModal({holding, onSave, onClose}) {
+  const [f, setF] = useState(holding||{ticker:"",name:"",type:"stock",shares:"",divPerShare:"",freqId:"q_mar",notes:""});
+  const [st, setSt] = useState(""); const [ld, setLd] = useState(false);
+  const s = (k,v) => setF(p=>({...p,[k]:v}));
+  const lookup = () => {
+    if (!f.ticker) return; setSt("");
+    aiLookup(f.ticker, d=>{setF(p=>({...p,...d,ticker:p.ticker}));setSt("Data populated");}, e=>setSt("Error: "+e), setLd);
+  };
+  const valid = f.ticker && +f.shares >= 0 && +f.divPerShare >= 0;
+  const prev = +f.shares * +f.divPerShare * (FREQ.find(x=>x.id===f.freqId)?.months.length||12);
+  return (
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="mbox">
+        <div className="mhdr"><h3>{holding?"Edit Holding":"Add Holding"}</h3><button className="xbtn" onClick={onClose}>X</button></div>
+        <div className="lrow">
+          <input className="inp tkr" placeholder="TICKER" value={f.ticker} onChange={e=>s("ticker",e.target.value.toUpperCase())}/>
+          <button className="aibtn" onClick={lookup} disabled={!f.ticker||ld}>{ld?"...":"AI Lookup"}</button>
+        </div>
+        {st && <div className={"ast "+(st.startsWith("Data")?"ok":"er")}>{st}</div>}
+        <div className="fgrid">
+          <div className="fi full"><label>Security Name</label><input className="inp" value={f.name} onChange={e=>s("name",e.target.value)}/></div>
+          <div className="fi"><label>Type</label>
+            <select className="inp" value={f.type} onChange={e=>s("type",e.target.value)}>
+              {Object.entries(SEC_TYPES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+            </select>
+          </div>
+          <div className="fi"><label>Shares</label><input className="inp" type="number" min="0" step="0.01" value={f.shares} onChange={e=>s("shares",e.target.value)}/></div>
+          <div className="fi"><label>Dividend per Payment ($)</label><input className="inp" type="number" min="0" step="0.0001" value={f.divPerShare} onChange={e=>s("divPerShare",e.target.value)}/></div>
+          <div className="fi"><label>Frequency</label>
+            <select className="inp" value={f.freqId} onChange={e=>s("freqId",e.target.value)}>
+              {FREQ.map(x=><option key={x.id} value={x.id}>{x.label}</option>)}
+            </select>
+          </div>
+          <div className="fi full"><label>Notes</label><input className="inp" value={f.notes||""} onChange={e=>s("notes",e.target.value)}/></div>
+        </div>
+        {+f.shares>0&&+f.divPerShare>0&&<div className="prev">Annual: <strong>{fmt(prev)}</strong></div>}
+        <div className="mftr">
+          <button className="cbtn" onClick={onClose}>Cancel</button>
+          <button className="sbtn" disabled={!valid} onClick={()=>onSave({...f,shares:+f.shares,divPerShare:+f.divPerShare,id:holding?.id||Date.now()})}>
+            {holding?"Save":"Add Holding"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ImportModal({rows, onConfirm, onClose}) {
+  const [sel, setSel] = useState(rows.map(r=>({...r,_on:true})));
+  const tog = i => setSel(p=>p.map(r=>r._idx===i?{...r,_on:!r._on}:r));
+  const inc = sel.filter(r=>r._on);
+  return (
+    <div className="overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="mbox" style={{maxWidth:580}}>
+        <div className="mhdr"><h3>Import Preview - {inc.length} positions</h3><button className="xbtn" onClick={onClose}>X</button></div>
+        <p style={{fontSize:12,color:"#64748b",marginBottom:12}}>Review positions below. Uncheck any to exclude. Dividend rates will be added after import using AI Lookup.</p>
+        <div style={{maxHeight:320,overflowY:"auto",border:"1px solid #e2e8f0",borderRadius:8,marginBottom:16}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <thead><tr style={{background:"#f8fafc",position:"sticky",top:0}}>
+              <th style={{padding:"8px 10px",textAlign:"left",borderBottom:"1px solid #e2e8f0",fontFamily:"monospace",fontSize:10,textTransform:"uppercase"}}></th>
+              <th style={{padding:"8px 10px",textAlign:"left",borderBottom:"1px solid #e2e8f0",fontFamily:"monospace",fontSize:10,textTransform:"uppercase"}}>Ticker</th>
+              <th style={{padding:"8px 10px",textAlign:"left",borderBottom:"1px solid #e2e8f0",fontFamily:"monospace",fontSize:10,textTransform:"uppercase"}}>Name</th>
+              <th style={{padding:"8px 10px",textAlign:"right",borderBottom:"1px solid #e2e8f0",fontFamily:"monospace",fontSize:10,textTransform:"uppercase"}}>Shares</th>
+            </tr></thead>
+            <tbody>
+              {sel.map(r=>(
+                <tr key={r._idx} style={{opacity:r._on?1:0.35,borderBottom:"1px solid #f1f5f9"}}>
+                  <td style={{padding:"7px 10px"}}><input type="checkbox" checked={r._on} onChange={()=>tog(r._idx)}/></td>
+                  <td style={{padding:"7px 10px",fontFamily:"monospace",fontWeight:600}}>{r.ticker}</td>
+                  <td style={{padding:"7px 10px",color:"#64748b",maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name}</td>
+                  <td style={{padding:"7px 10px",fontFamily:"monospace",textAlign:"right"}}>{r.shares}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="mftr">
+          <button className="cbtn" onClick={onClose}>Cancel</button>
+          <button className="sbtn" onClick={()=>onConfirm(inc)}>Import {inc.length} Positions</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PaymentSchedule({holdings}) {
+  const now = new Date();
+  const thisM = now.getMonth();
+  const nextM = (thisM + 1) % 12;
+
+  const payersFor = mi =>
+    holdings
+      .filter(h => { const f=FREQ.find(f=>f.id===h.freqId); return f?.months.includes(mi+1)&&h.divPerShare>0; })
+      .map(h => ({...h, amount:h.shares*h.divPerShare, estDay:h.lastPaymentDate?+h.lastPaymentDate.split('-')[2]:null}))
+      .sort((a,b) => {
+        if (a.estDay!==null&&b.estDay!==null) return a.estDay-b.estDay;
+        if (a.estDay!==null) return -1;
+        if (b.estDay!==null) return 1;
+        return b.amount-a.amount;
+      });
+
+  function MonthCard({label, mi, accent}) {
+    const list = payersFor(mi);
+    const total = list.reduce((s,h)=>s+h.amount,0);
+    return (
+      <div className="card" style={accent?{borderColor:"#3b82f6",borderWidth:2}:{}}>
+        <div className="chdr">
+          <span className="ctit" style={accent?{color:"#3b82f6"}:{}}>{label}</span>
+          {list.length>0&&<span style={{fontFamily:"'DM Mono',monospace",fontSize:14,fontWeight:500,color:"#10b981"}}>{fmt(total)}</span>}
+        </div>
+        {list.length===0
+          ? <div style={{textAlign:"center",color:"#94a3b8",fontSize:12,padding:"20px 0"}}>No dividend payments this month</div>
+          : <table className="tbl">
+              <thead><tr><th>Ticker</th><th>Name</th><th>Type</th><th>Est. Pay Date</th><th style={{textAlign:"right"}}>Amount</th></tr></thead>
+              <tbody>
+                {list.map(h=>{
+                  const ti=SEC_TYPES[h.type];
+                  const estDate=h.estDay?`${MN[mi]}/${String(h.estDay).padStart(2,"0")}`:"--";
+                  return (
+                    <tr key={h.id}>
+                      <td><div style={{display:"flex",alignItems:"center",gap:5}}><span style={{width:6,height:6,borderRadius:"50%",background:ti?.color,display:"inline-block",flexShrink:0}}/><span style={{fontFamily:"monospace",fontWeight:600,fontSize:11}}>{h.ticker}</span></div></td>
+                      <td><div style={{fontSize:10,color:"#64748b",maxWidth:220,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.name}</div></td>
+                      <td><span style={{background:ti?.bg,color:ti?.color,fontFamily:"monospace",fontSize:9,padding:"2px 6px",borderRadius:20}}>{ti?.label}</span></td>
+                      <td style={{fontFamily:"monospace",fontSize:11,color:"#64748b"}}>{estDate}</td>
+                      <td style={{fontFamily:"monospace",fontSize:11,color:"#10b981",textAlign:"right"}}>{fmt(h.amount)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+        }
+      </div>
+    );
+  }
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <MonthCard label={`This Month — ${MN[thisM]} ${now.getFullYear()}`} mi={thisM} accent={true}/>
+      <MonthCard label={`Next Month — ${MN[nextM]} ${nextM<thisM?now.getFullYear()+1:now.getFullYear()}`} mi={nextM} accent={false}/>
+
+      <div className="card">
+        <div className="chdr"><span className="ctit">Full Year Payment Schedule</span><span className="cbdg">Estimated dates based on last known payment</span></div>
+        <div style={{display:"flex",flexDirection:"column",gap:20}}>
+          {MN.map((m,i)=>{
+            const list=payersFor(i);
+            const total=list.reduce((s,h)=>s+h.amount,0);
+            const isCur=i===thisM;
+            return (
+              <div key={m}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",paddingBottom:6,marginBottom:8,borderBottom:`2px solid ${isCur?"#bfdbfe":"#f1f5f9"}`}}>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontWeight:700,fontSize:12,color:isCur?"#3b82f6":"#1e293b"}}>
+                    {m}{isCur?" ← now":""}
+                  </span>
+                  {list.length>0
+                    ? <span style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"#10b981"}}>{fmt(total)} · {list.length} payer{list.length!==1?"s":""}</span>
+                    : <span style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"#cbd5e1"}}>no payments</span>
+                  }
+                </div>
+                {list.length>0&&(
+                  <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                    {list.map(h=>{
+                      const ti=SEC_TYPES[h.type];
+                      const estDate=h.estDay?`${m}/${String(h.estDay).padStart(2,"0")}`:"--";
+                      return (
+                        <div key={h.id} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 8px",background:isCur?"#eff6ff":"#f8fafc",borderRadius:6,border:`1px solid ${isCur?"#bfdbfe":"#f1f5f9"}`}}>
+                          <span style={{width:6,height:6,borderRadius:"50%",background:ti?.color,flexShrink:0}}/>
+                          <span style={{fontFamily:"monospace",fontWeight:600,fontSize:11,width:64,flexShrink:0}}>{h.ticker}</span>
+                          <span style={{flex:1,fontSize:10,color:"#64748b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.name}</span>
+                          <span style={{fontFamily:"monospace",fontSize:10,color:"#94a3b8",width:52,flexShrink:0,textAlign:"right"}}>{estDate}</span>
+                          <span style={{fontFamily:"monospace",fontSize:11,color:"#10b981",width:68,textAlign:"right",flexShrink:0}}>{fmt(h.amount)}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Welcome({onImport, onManual, fileRef}) {
+  return (
+    <div className="welcome">
+      <div className="wicon">$</div>
+      <h1 className="wtitle">Dividend Finder</h1>
+      <p className="wsub">See how much dividend and interest income your portfolio generates, month by month and year by year.</p>
+      <div className="wbtns">
+        <button className="wbtn-import" onClick={()=>fileRef.current&&fileRef.current.click()}>Import Brokerage CSV File</button>
+        <button className="wbtn-manual" onClick={onManual}>Add Holdings Manually</button>
+      </div>
+      <p className="wprivacy">Your data never leaves your browser. Nothing is stored on any server.</p>
+    </div>
+  );
 }
 
 export default function App() {
-  const [holdings, setHoldings]     = useState([]);
-  const [problems, setProblems]     = useState([]);
-  const [running, setRunning]       = useState(false);
+  const [holdings, setHoldings] = useState([]);
+  const [view, setView] = useState("dashboard");
+  const [modal, setModal] = useState(null);
+  const [impModal, setImpModal] = useState(null);
+  const [active, setActive] = useState(null);
+  const [target, setTarget] = useState(60000);
+  const [editTarget, setEditTarget] = useState(false);
+  const [tmpTarget, setTmpTarget] = useState("60000");
+  const [rdy, setRdy] = useState(false);
+  const [bulkRunning, setBulkRunning] = useState(false);
   const [bulkStatus, setBulkStatus] = useState("");
-  const [done, setDone]             = useState(false);
-  const [rawText, setRawText]       = useState("");
   const fileRef = useRef();
+
+  useEffect(()=>{
+    (async()=>{
+      try {
+        const s = await window.storage?.get("ppic_v3");
+        const t = await window.storage?.get("ppic_target_v3");
+        if (s?.value) { const p=JSON.parse(s.value); if(p.length>0) setHoldings(p); }
+        if (t?.value) setTarget(+t.value);
+      } catch {}
+      setRdy(true);
+    })();
+  },[]);
+
+  useEffect(()=>{ if(!rdy) return; window.storage?.set("ppic_v3",JSON.stringify(holdings)).catch(()=>{}); },[holdings,rdy]);
+  useEffect(()=>{ if(!rdy) return; window.storage?.set("ppic_target_v3",String(target)).catch(()=>{}); },[target,rdy]);
+
+  const saveH = h => { setHoldings(p=>modal?.id?p.map(x=>x.id===h.id?h:x):[...p,h]); setModal(null); };
+  const delH = id => setHoldings(p=>p.filter(h=>h.id!==id));
+  const updS = (id,v) => setHoldings(p=>p.map(h=>h.id===id?{...h,shares:Math.max(0,+v||0)}:h));
 
   const handleFile = e => {
     const file = e.target.files[0]; if (!file) return;
     const reader = new FileReader();
     reader.onload = ev => {
-      const text = ev.target.result;
-      setRawText(text);
       try {
-        const rows = parseCSV(text);
-        const mapped = rows.map((r,i) => ({
-          id: Date.now()+i,
-          ticker: (r["Symbol"]||r["symbol"]||r["Ticker"]||"").replace(/\s/g,"").toUpperCase(),
-          name: (r["Description"]||r["description"]||r["Name"]||r["Investment Name"]||"").trim(),
-          shares: parseNum(getShares(r)),
-          divPerShare: 0,
-          freqId: "q_mar",
-          notes: "needs-lookup",
-        })).filter(r => r.ticker && r.ticker.length >= 1 && r.ticker.length <= 12 && r.shares > 0);
-        if (!mapped.length) { alert("No positions found. Please use a CSV positions export from your brokerage."); return; }
-        setHoldings(mapped);
-        setProblems([]);
-        setDone(false);
-        setBulkStatus("");
-      } catch(err) { alert("Could not read file: " + err.message); }
+        const rows = parseCSV(ev.target.result);
+        const mapped = rows.map((r,i)=>({
+          _idx:i,
+          ticker:(r["Symbol"]||r["symbol"]||r["Ticker"]||"").replace(/\s/g,"").toUpperCase(),
+          name:(r["Description"]||r["description"]||r["Name"]||r["Investment Name"]||"").trim(),
+          shares:parseNum(getShares(r)),
+        })).filter(r=>r.ticker&&r.ticker.length>=1&&r.ticker.length<=12&&r.shares>0);
+        if (mapped.length===0) { alert("No positions found. Please use a CSV positions export from your brokerage."); return; }
+        setImpModal(mapped);
+      } catch(err) { alert("Could not read file: "+err.message); }
     };
     reader.readAsText(file);
-    e.target.value = "";
+    e.target.value="";
+  };
+
+  const confirmImport = rows => {
+    const newH = rows.map((r,i)=>({
+      id:Date.now()+i, ticker:r.ticker, name:r.name||r.ticker,
+      type:"stock", shares:r.shares, divPerShare:0, freqId:"q_mar", notes:"needs-lookup",
+    }));
+    setHoldings(p=>[...p,...newH]);
+    setImpModal(null);
   };
 
   const bulkLookup = async () => {
-    const missing = holdings.filter(h => !h.divPerShare || h.notes === "needs-lookup");
-    if (!missing.length) { setDone(true); return; }
-    setRunning(true);
-
-    // Step 1: bulk fetch all tickers via Railway
-    setBulkStatus("Looking up " + missing.length + " tickers...");
-    const tickers = missing.map(h => h.ticker);
-    let data;
-    try {
-      data = await fetchDividends(tickers);
-    } catch(e) {
-      setBulkStatus("Error: " + e.message);
-      setRunning(false);
-      return;
+    const missing = holdings.filter(h=>h.notes==="needs-lookup");
+    if (!missing.length) { setBulkStatus("All positions have rates."); setTimeout(()=>setBulkStatus(""),3000); return; }
+    setBulkRunning(true);
+    let done=0;
+    for (const h of missing) {
+      setBulkStatus(done+"/"+missing.length+" - looking up "+h.ticker+"...");
+      await new Promise(res=>{
+        const timer = setTimeout(()=>{ done++; res(); }, 30000);
+        aiLookup(h.ticker,
+          d=>{
+            clearTimeout(timer);
+            setHoldings(p=>p.map(x=>x.id===h.id?{...x,...d,ticker:x.ticker,shares:x.shares,notes:""}:x));
+            done++; res();
+          },
+          ()=>{ clearTimeout(timer); done++; res(); },
+          ()=>{}
+        );
+      });
+      await new Promise(r=>setTimeout(r,300));
     }
-
-    // Build result map
-    const resultMap = {};
-    (data.results || []).forEach(r => { resultMap[r.yahoo_symbol] = r; });
-
-    // Identify found vs problems
-    const foundProblems = [];
-    missing.forEach(h => {
-      const r = resultMap[h.ticker];
-      if (r && r.annual_income_per_share > 0 && r.payment_frequency > 0) {
-        // Found — update silently
-        setHoldings(p => p.map(x => x.id === h.id ? {
-          ...x, divPerShare: r.annual_income_per_share / r.payment_frequency,
-          freqId: r.freqId || "q_mar", notes: ""
-        } : x));
-      } else {
-        foundProblems.push({ ...h, status: "red", suggestion: null, manualDiv: "", altTicker: "" });
-      }
-    });
-
-    // Step 2: for each problem, silently try candidates via Railway
-    if (foundProblems.length > 0) {
-      setBulkStatus("Resolving " + foundProblems.length + " problem ticker(s)...");
-      for (let i = 0; i < foundProblems.length; i++) {
-        const p = foundProblems[i];
-        const candidates = getCandidates(p.ticker);
-        let resolved = false;
-        for (const candidate of candidates) {
-          try {
-            const cd = await fetchDividends([candidate]);
-            const r = (cd.results || [])[0];
-            if (r && r.annual_income_per_share > 0 && r.payment_frequency > 0) {
-              foundProblems[i] = {
-                ...p, status: "yellow",
-                suggestion: {
-                  ticker: candidate,
-                  divPerShare: r.annual_income_per_share / r.payment_frequency,
-                  freqId: r.freqId || "q_mar",
-                  annualPerShare: r.annual_income_per_share,
-                }
-              };
-              resolved = true;
-              break;
-            }
-          } catch { /* try next */ }
-        }
-        if (!resolved) foundProblems[i] = { ...p, status: "red" };
-      }
-    }
-
-    setProblems(foundProblems);
-    setRunning(false);
-    setDone(true);
-    setBulkStatus("");
+    setBulkRunning(false);
+    setBulkStatus("Done - "+done+"/"+missing.length+" updated");
+    setTimeout(()=>setBulkStatus(""),5000);
   };
 
-  const acceptSuggestion = id => {
-    setProblems(p => p.map(x => {
-      if (x.id !== id || !x.suggestion) return x;
-      setHoldings(h => h.map(hx => hx.id === id ? {
-        ...hx, ticker: x.suggestion.ticker,
-        divPerShare: x.suggestion.divPerShare,
-        freqId: x.suggestion.freqId, notes: ""
-      } : hx));
-      return { ...x, status: "green", altTicker: x.suggestion.ticker };
-    }));
-  };
+  const mo = calcMonthly(holdings);
+  const types = calcTypes(holdings);
+  const ann = mo.reduce((a,b)=>a+b,0);
+  const avg = ann/12;
+  const mx = Math.max(...mo,1);
+  const bst = mo.indexOf(Math.max(...mo));
+  const now = new Date().getMonth();
+  const gap = ann-target;
+  const needsLookup = holdings.filter(h=>h.notes==="needs-lookup").length;
+  const mktVal = holdings.reduce((a,h)=>a+(h.price||0)*h.shares,0);
 
-  const setManualDiv = (id, val) => {
-    setProblems(p => p.map(x => {
-      if (x.id !== id) return x;
-      const v = parseFloat(val);
-      if (v > 0) {
-        setHoldings(h => h.map(hx => hx.id === id ? { ...hx, divPerShare: v, notes: "" } : hx));
-        return { ...x, manualDiv: val, status: "green" };
-      }
-      return { ...x, manualDiv: val };
-    }));
-  };
+  const barD = MN.map((m,i)=>({month:m,income:+mo[i].toFixed(2)}));
+  const cumD = MN.map((m,i)=>({month:m,actual:+mo.slice(0,i+1).reduce((a,b)=>a+b,0).toFixed(2),target:+((target/12)*(i+1)).toFixed(2)}));
+  const payers = mi => holdings.filter(h=>{const f=FREQ.find(f=>f.id===h.freqId);return f?.months.includes(mi+1)&&h.divPerShare>0;});
 
-  const exportCSV = () => {
-    const lines = rawText.replace(/\r/g,"").split("\n");
-    let hi = 0;
-    for (let i = 0; i < Math.min(15, lines.length); i++) {
-      const low = lines[i].replace(/"/g,"").toLowerCase();
-      if (low.startsWith("symbol") || low.includes(",symbol,")) { hi = i; break; }
-    }
-    const tickerMap = {};
-    problems.forEach(p => { if (p.altTicker) tickerMap[p.ticker] = p.altTicker; });
-    const head = lines.slice(0, hi+1).join("\n");
-    const body = lines.slice(hi+1).filter(l => l.trim()).map(l => {
-      const sym = l.split(",")[0].replace(/"/g,"").trim().toUpperCase();
-      const mapped = tickerMap[sym];
-      if (mapped && mapped !== sym) return l.replace(sym, mapped);
-      return l;
-    });
-    const out = head + "\n" + body.join("\n");
-    const blob = new Blob([out], {type:"text/csv"});
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = "dividend-finder-corrected.csv"; a.click();
-  };
+  if (!rdy) return <div style={{minHeight:"100vh",background:"#f1f5f9"}}/>;
 
-  const allResolved = problems.length > 0 && problems.every(p => p.status === "green");
-  const needsLookup = holdings.filter(h => !h.divPerShare || h.notes === "needs-lookup").length;
+  if (holdings.length===0) return (
+    <>
+      <style>{CSS}</style>
+      <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={handleFile}/>
+      <Welcome onImport={handleFile} onManual={()=>setModal("add")} fileRef={fileRef}/>
+      {modal&&<HoldingModal holding={null} onSave={saveH} onClose={()=>setModal(null)}/>}
+      {impModal&&<ImportModal rows={impModal} onConfirm={confirmImport} onClose={()=>setImpModal(null)}/>}
+    </>
+  );
 
   return (
-    <div style={{minHeight:"100vh",background:"#f1f5f9",fontFamily:"'Outfit',sans-serif"}}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Outfit:wght@400;500;600;700;800&display=swap');
-        *{box-sizing:border-box;margin:0;padding:0}
-        body{background:#f1f5f9}
-        .lbtn{background:#fef3c7;color:#92400e;border:1px solid #fcd34d;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-weight:600;font-size:12px;cursor:pointer}
-        .lbtn:disabled{opacity:.4;cursor:not-allowed}
-        .ibtn{background:#fff;color:#1e293b;border:1px solid #cbd5e1;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-weight:600;font-size:12px;cursor:pointer}
-        .ibtn:hover{border-color:#3b82f6;color:#3b82f6}
-        .rbtn{background:#fff;color:#94a3b8;border:1px solid #e2e8f0;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-size:12px;cursor:pointer}
-        .accept-btn{background:#10b98115;border:1px solid #10b98144;color:#10b981;border-radius:8px;padding:6px 14px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:700;cursor:pointer;transition:all .15s}
-        .accept-btn:hover{background:#10b98125}
-        .exp-btn{background:#3b82f6;color:#fff;border:none;border-radius:10px;padding:11px 24px;font-family:'Outfit',sans-serif;font-weight:700;font-size:13px;cursor:pointer}
-        .exp-btn:hover{background:#2563eb}
-        .manual-inp{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;color:#1e293b;font-family:'DM Mono',monospace;font-size:12px;padding:6px 10px;width:130px;outline:none}
-        .manual-inp:focus{border-color:#8b5cf6}
-        .upload-zone{border:2px dashed #cbd5e1;border-radius:16px;padding:60px 40px;text-align:center;cursor:pointer;transition:all .25s;background:#fff}
-        .upload-zone:hover{border-color:#10b981;background:#f0fdf4}
-        .bstat{font-family:'DM Mono',monospace;font-size:11px;color:#10b981;background:#f0fdf4;border:1px solid #bbf7d0;padding:4px 9px;border-radius:8px}
-      `}</style>
+    <>
+      <style>{CSS}</style>
+      <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={handleFile}/>
+      <div className="app">
 
-      <div style={{background:"#fff",borderBottom:"2px solid #e2e8f0",padding:"14px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
-        <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <div style={{fontSize:28,fontWeight:900,color:"#10b981"}}>$</div>
-          <div>
-            <div style={{fontSize:18,fontWeight:800,letterSpacing:"-.02em"}}>Dividend Finder</div>
-            <div style={{fontSize:11,color:"#64748b",marginTop:1}}>Step 1 — Find and fix problem tickers before running the calculator</div>
+        <header className="hdr">
+          <div className="hleft">
+            <div className="logo">$</div>
+            <div>
+              <div className="title">Dividend Finder</div>
+              <div className="sub">{holdings.length} positions</div>
+            </div>
+            <div className="navtabs">
+              <button className={"ntab"+(view==="dashboard"?" active":"")} onClick={()=>setView("dashboard")}>Dashboard</button>
+              <button className={"ntab"+(view==="schedule"?" active":"")} onClick={()=>setView("schedule")}>Payment Schedule</button>
+            </div>
           </div>
-        </div>
-        <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
-          {needsLookup > 0 && !done && (
-            <button className="lbtn" onClick={bulkLookup} disabled={running}>
-              {running ? "Running..." : `Lookup ${needsLookup} tickers`}
-            </button>
-          )}
-          {bulkStatus && <span className="bstat">{bulkStatus}</span>}
-          {holdings.length > 0 && <button className="ibtn" onClick={() => fileRef.current?.click()}>Import CSV</button>}
-          {holdings.length > 0 && <button className="rbtn" onClick={() => {setHoldings([]);setProblems([]);setDone(false);}}>Reset</button>}
-        </div>
-      </div>
-
-      <div style={{maxWidth:900,margin:"0 auto",padding:"24px 16px 60px"}}>
-        <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={handleFile}/>
-
-        {holdings.length === 0 ? (
-          <div className="upload-zone" onClick={() => fileRef.current?.click()}>
-            <div style={{fontSize:40,marginBottom:12}}>📂</div>
-            <div style={{fontWeight:700,fontSize:18,color:"#1e293b",marginBottom:6}}>Upload Your Brokerage CSV</div>
-            <div style={{fontSize:13,color:"#64748b"}}>Schwab, Fidelity, Vanguard — same file you use in the Portfolio Calculator</div>
+          <div className="hright">
+            {needsLookup>0&&<button className="lbtn" onClick={bulkLookup} disabled={bulkRunning}>{bulkRunning?"Running...":"Lookup "+needsLookup+" rates"}</button>}
+            {bulkStatus&&<span className="bstat">{bulkStatus}</span>}
+            <button className="ibtn" onClick={()=>fileRef.current&&fileRef.current.click()}>Import CSV</button>
+            <button className="abtn" onClick={()=>setModal("add")}>+ Add</button>
+            <button className="rbtn" onClick={()=>{setHoldings([]);setView("dashboard");}}>Reset</button>
           </div>
+        </header>
 
-        ) : !done ? (
-          <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:12,padding:"32px",textAlign:"center",boxShadow:"0 1px 3px #0000000a"}}>
-            <div style={{fontSize:36,marginBottom:12}}>🔍</div>
-            <div style={{fontWeight:700,fontSize:18,marginBottom:8}}>{holdings.length} positions loaded</div>
-            <div style={{color:"#64748b",fontSize:13,marginBottom:24}}>Click the yellow button above to look up dividends for all tickers. Only problem tickers will be shown.</div>
-            {running && bulkStatus && (
-              <div style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"#10b981",background:"#f0fdf4",border:"1px solid #bbf7d0",padding:"8px 16px",borderRadius:8,display:"inline-block"}}>{bulkStatus}</div>
+        {view==="schedule"&&<PaymentSchedule holdings={holdings}/>}
+
+        {view==="dashboard"&&<><div className="goalbar">
+          <div className="goalleft">
+            <span className="goallbl">Annual Income Goal:</span>
+            {editTarget?(
+              <span style={{display:"flex",alignItems:"center",gap:8}}>
+                $<input className="goalinp" type="number" value={tmpTarget} onChange={e=>setTmpTarget(e.target.value)}
+                  onBlur={()=>{setTarget(+tmpTarget||60000);setEditTarget(false);}}
+                  onKeyDown={e=>{if(e.key==="Enter"||e.key==="Escape"){setTarget(+tmpTarget||60000);setEditTarget(false);}}} autoFocus/>
+              </span>
+            ):(
+              <span className="goalval" onClick={()=>{setTmpTarget(String(target));setEditTarget(true);}}>{fmt(target)} (click to edit)</span>
             )}
           </div>
-
-        ) : problems.length === 0 ? (
-          <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:12,padding:"32px",textAlign:"center"}}>
-            <div style={{fontSize:40,marginBottom:12}}>✅</div>
-            <div style={{fontWeight:700,fontSize:20,color:"#15803d",marginBottom:8}}>All {holdings.length} tickers confirmed</div>
-            <div style={{color:"#166534",fontSize:13,marginBottom:24}}>Every position returned valid dividend data. Your CSV is ready to use in the Portfolio Calculator as-is.</div>
-            <div style={{color:"#15803d",fontSize:12,fontFamily:"'DM Mono',monospace"}}>No corrections needed — use your original CSV file in the calculator.</div>
-          </div>
-
-        ) : (
-          <>
-            <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:10,padding:"14px 18px",marginBottom:20,display:"flex",gap:12,alignItems:"flex-start"}}>
-              <span style={{fontSize:20,flexShrink:0}}>⚠️</span>
-              <div>
-                <div style={{fontWeight:700,color:"#dc2626",fontSize:14}}>
-                  {problems.filter(p=>p.status==="red").length > 0
-                    ? `${problems.filter(p=>p.status==="red").length} ticker${problems.filter(p=>p.status==="red").length>1?"s":""} could not be found`
-                    : "All problems resolved — ready to export"}
-                </div>
-                <div style={{fontSize:12,color:"#991b1b",marginTop:3}}>
-                  {problems.filter(p=>p.status==="green").length} of {problems.length} resolved.
-                  {allResolved ? " Download the corrected CSV and run it in the Portfolio Calculator." : " Accept a suggestion or enter the dividend manually for each red ticker."}
-                </div>
-              </div>
+          <div className="goalright">
+            <div className="goaltrack">
+              <div className="goalfill" style={{width:Math.min(ann/target*100,100).toFixed(1)+"%",background:gap>=0?"#10b981":"#3b82f6"}}/>
             </div>
+            <span className="goalpct" style={{color:gap>=0?"#10b981":"#3b82f6"}}>
+              {(ann/target*100).toFixed(0)}% {gap>=0?"above goal":fmt(Math.abs(gap))+" to go"}
+            </span>
+          </div>
+        </div>
 
-            <div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:20}}>
-              {problems.map(p => (
-                <div key={p.id} style={{background:"#fff",border:`1px solid ${p.status==="green"?"#bbf7d0":p.status==="yellow"?"#fcd34d33":"#fecaca"}`,borderRadius:12,padding:"18px 20px",boxShadow:"0 1px 3px #0000000a"}}>
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
-                    <div style={{display:"flex",alignItems:"center",gap:12}}>
-                      <span style={{fontSize:20}}>{p.status==="green"?"✅":p.status==="yellow"?"💡":"❌"}</span>
-                      <div>
-                        <div style={{fontFamily:"'DM Mono',monospace",fontWeight:600,fontSize:16,color:p.status==="green"?"#15803d":p.status==="yellow"?"#92400e":"#dc2626"}}>
-                          {p.ticker}
-                          {p.altTicker && <span style={{fontSize:12,color:"#64748b",marginLeft:8}}>→ using {p.altTicker}</span>}
-                        </div>
-                        <div style={{fontSize:12,color:"#64748b",marginTop:2}}>{p.name}</div>
-                      </div>
-                    </div>
-                    <div style={{fontSize:12,color:"#94a3b8",fontFamily:"'DM Mono',monospace"}}>{p.shares.toLocaleString()} shares</div>
+        <div className="kpis">
+          {[
+            {l:"Annual Income",   v:fmt(ann),        s:"projected",        c:"#1e293b"},
+            {l:"Monthly Avg",     v:fmt(avg),        s:"per month",        c:"#1e293b"},
+            {l:"Best Month",      v:MN[bst],         s:fmt(Math.max(...mo))+" est", c:"#8b5cf6"},
+            {l:"Income Goal",     v:fmt(target),     s:"your target",      c:"#1e293b"},
+            {l:"Progress",        v:(ann/target*100).toFixed(0)+"%", s:gap>=0?"on track":"needs income", c:gap>=0?"#10b981":"#3b82f6"},
+            {l:"Holdings",        v:holdings.length, s:"positions",        c:"#1e293b"},
+            {l:"Market Value",    v:mktVal>0?fmt(mktVal):"--", s:"based on lookups", c:"#1e293b"},
+          ].map((k,i)=>(
+            <div key={i} className="kpi">
+              <div className="klbl">{k.l}</div>
+              <div className="kval" style={{color:k.c}}>{k.v}</div>
+              <div className="ksub">{k.s}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="card">
+          <div className="chdr"><span className="ctit">Monthly Income Forecast</span><span className="cbdg">Click a bar to see which positions pay that month</span></div>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={barD} margin={{top:8,right:16,left:8,bottom:0}}
+              onClick={d=>d?.activeTooltipIndex!=null&&setActive(active===d.activeTooltipIndex?null:d.activeTooltipIndex)}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false}/>
+              <XAxis dataKey="month" tick={{fill:"#94a3b8",fontSize:11}} axisLine={false} tickLine={false}/>
+              <YAxis tick={{fill:"#94a3b8",fontSize:10}} axisLine={false} tickLine={false} tickFormatter={v=>"$"+(v>=1000?(v/1000).toFixed(1)+"k":v)}/>
+              <Tooltip contentStyle={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,fontFamily:"monospace"}} formatter={v=>[fmt(v),"Income"]} cursor={{fill:"#3b82f608"}}/>
+              <Bar dataKey="income" radius={[4,4,0,0]}>
+                {barD.map((_,i)=><Cell key={i} fill={i===active?"#3b82f6":i===now?"#10b98166":"#3b82f633"} stroke={i===active?"#3b82f6":"transparent"}/>)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+          <div className="hint">Monthly goal pace: {fmt(target/12)} | Blue = selected | Green = current month</div>
+          {active!==null&&(
+            <div className="mdet">
+              <div className="mdhdr"><strong>{MN[active]} - {payers(active).length} payers</strong><span style={{color:"#3b82f6",fontFamily:"monospace"}}>{fmt(mo[active])}</span></div>
+              <div className="chips">
+                {payers(active).sort((a,b)=>(b.shares*b.divPerShare)-(a.shares*a.divPerShare)).map(h=>(
+                  <div key={h.id} className="chip">
+                    <span style={{width:6,height:6,borderRadius:"50%",background:SEC_TYPES[h.type]?.color,display:"inline-block"}}/>
+                    <span style={{fontFamily:"monospace",fontWeight:600,fontSize:11}}>{h.ticker}</span>
+                    <span style={{fontFamily:"monospace",fontSize:10,color:"#10b981"}}>{fmt(h.shares*h.divPerShare)}</span>
+                    {h.lastPaymentDate&&<span style={{fontFamily:"monospace",fontSize:9,color:"#94a3b8"}}>est.{fmtDate(h.lastPaymentDate)}</span>}
                   </div>
-
-                  {p.status === "yellow" && p.suggestion && (
-                    <div style={{marginTop:14,background:"#f0fdf4",border:"1px solid #10b98133",borderRadius:8,padding:"12px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
-                      <div style={{fontSize:13}}>
-                        <span style={{color:"#64748b"}}>Try </span>
-                        <span style={{fontFamily:"'DM Mono',monospace",fontWeight:700,color:"#10b981",fontSize:14}}>{p.suggestion.ticker}</span>
-                        <span style={{color:"#64748b"}}> instead</span>
-                        <span style={{margin:"0 8px",color:"#e2e8f0"}}>·</span>
-                        <span style={{fontFamily:"'DM Mono',monospace",color:"#10b981"}}>{fmt(p.suggestion.divPerShare,4)}/pmt</span>
-                        <span style={{margin:"0 8px",color:"#e2e8f0"}}>·</span>
-                        <span style={{fontSize:11,color:"#10b981"}}>pre-verified ✓</span>
-                      </div>
-                      <button className="accept-btn" onClick={() => acceptSuggestion(p.id)}>
-                        Accept → Use {p.suggestion.ticker}
-                      </button>
-                    </div>
-                  )}
-
-                  {p.status === "red" && (
-                    <div style={{marginTop:14,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
-                      <span style={{fontSize:13,color:"#64748b"}}>Enter dividend per payment manually:</span>
-                      <input className="manual-inp" type="number" min="0" step="0.0001" placeholder="e.g. 0.3438"
-                        value={p.manualDiv} onChange={e => setManualDiv(p.id, e.target.value)}/>
-                      {p.manualDiv && parseFloat(p.manualDiv) > 0 && <span style={{fontSize:12,color:"#10b981"}}>✓ Will be applied</span>}
-                    </div>
-                  )}
-
-                  {p.status === "green" && (
-                    <div style={{marginTop:10,fontSize:12,color:"#15803d",fontFamily:"'DM Mono',monospace"}}>
-                      ✓ Resolved — {p.altTicker ? `using ${p.altTicker}` : `manual entry: ${fmt(parseFloat(p.manualDiv),4)}/pmt`}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-
-            {allResolved && (
-              <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:12,padding:"20px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
-                <div>
-                  <div style={{fontWeight:700,color:"#1d4ed8",fontSize:14}}>All problems resolved — CSV is ready</div>
-                  <div style={{fontSize:12,color:"#3730a3",marginTop:4}}>Download the corrected CSV and import it into the Portfolio Calculator.</div>
-                </div>
-                <button className="exp-btn" onClick={exportCSV}>↓ Download Corrected CSV</button>
+                ))}
               </div>
-            )}
-          </>
-        )}
+            </div>
+          )}
+        </div>
+
+        <div className="midrow">
+          <div className="card">
+            <div className="chdr"><span className="ctit">Holdings</span><span className="cbdg">{holdings.length} positions - edit shares inline</span></div>
+            <div style={{overflowX:"auto"}}>
+              <table className="tbl">
+                <thead><tr><th>Ticker</th><th>Name</th><th>Type</th><th>Shares</th><th>Price</th><th>Mkt Value</th><th>Div/Pmt</th><th>Frequency</th><th>Annual</th><th></th></tr></thead>
+                <tbody>
+                  {holdings.map(h=>{
+                    const fr=FREQ.find(f=>f.id===h.freqId);
+                    const an=h.shares*h.divPerShare*(fr?.months.length||12);
+                    const ti=SEC_TYPES[h.type];
+                    const flag=h.notes==="needs-lookup";
+                    const mv=h.price!=null?h.price*h.shares:null;
+                    return (
+                      <tr key={h.id} style={{background:flag?"#fffbeb":""}}>
+                        <td><div style={{display:"flex",alignItems:"center",gap:5}}><span style={{width:6,height:6,borderRadius:"50%",background:ti?.color,display:"inline-block",flexShrink:0}}/><span style={{fontFamily:"monospace",fontWeight:600,fontSize:11}}>{h.ticker}{flag&&<span style={{color:"#f59e0b",fontSize:9,marginLeft:2}}>!</span>}</span></div></td>
+                        <td><div style={{fontSize:10,color:"#64748b",maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.name}</div></td>
+                        <td><span style={{background:ti?.bg,color:ti?.color,fontFamily:"monospace",fontSize:9,padding:"2px 6px",borderRadius:20}}>{ti?.label}</span></td>
+                        <td><input className="sinp" type="number" min="0" step="0.01" value={h.shares} onChange={e=>updS(h.id,e.target.value)}/></td>
+                        <td style={{fontFamily:"monospace",fontSize:10,color:"#64748b"}}>{h.price!=null?fmt(h.price,2):"--"}</td>
+                        <td style={{fontFamily:"monospace",fontSize:10}}>{mv!=null?fmt(mv):"--"}</td>
+                        <td style={{fontFamily:"monospace",fontSize:10}}>{h.divPerShare>0?fmt(h.divPerShare,4):"--"}</td>
+                        <td style={{fontSize:9,color:"#64748b",whiteSpace:"nowrap"}}>{fr?.label.split(" (")[0]}</td>
+                        <td style={{fontFamily:"monospace",fontSize:10,color:an>0?"#10b981":"#94a3b8"}}>{an>0?fmt(an):"No Dividend"}</td>
+                        <td><div style={{display:"flex",gap:3}}>
+                          <button className="rb" onClick={()=>setModal(h)}>Edit</button>
+                          <button className="rb del" onClick={()=>delH(h.id)}>X</button>
+                        </div></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div className="card">
+              <div className="chdr"><span className="ctit">By Type</span></div>
+              {types.length>0?(
+                <>
+                  <ResponsiveContainer width="100%" height={150}>
+                    <PieChart><Pie data={types} dataKey="value" nameKey="label" cx="50%" cy="50%" innerRadius={38} outerRadius={62} paddingAngle={3}>
+                      {types.map((d,i)=><Cell key={i} fill={d.color} stroke="transparent"/>)}
+                    </Pie><Tooltip formatter={v=>fmt(v)} contentStyle={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,fontFamily:"monospace",fontSize:11}}/></PieChart>
+                  </ResponsiveContainer>
+                  <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:5}}>
+                    {types.map(d=>(
+                      <div key={d.type} style={{display:"flex",alignItems:"center",gap:7,fontSize:11}}>
+                        <span style={{width:7,height:7,borderRadius:"50%",background:d.color,flexShrink:0}}/>
+                        <span style={{flex:1,color:"#64748b",fontFamily:"monospace",fontSize:10}}>{d.label}</span>
+                        <span style={{fontFamily:"monospace"}}>{fmt(d.value)}</span>
+                        <span style={{color:"#94a3b8",fontFamily:"monospace",fontSize:10}}>{(d.value/ann*100).toFixed(0)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ):<div style={{textAlign:"center",color:"#94a3b8",fontSize:12,padding:20}}>Add dividend rates to see breakdown</div>}
+            </div>
+            <div className="card">
+              <div className="chdr"><span className="ctit">Cumulative vs Goal</span></div>
+              <ResponsiveContainer width="100%" height={120}>
+                <AreaChart data={cumD} margin={{top:8,right:12,left:0,bottom:0}}>
+                  <defs><linearGradient id="cg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#3b82f6" stopOpacity={0.2}/><stop offset="100%" stopColor="#3b82f6" stopOpacity={0}/></linearGradient></defs>
+                  <XAxis dataKey="month" tick={{fill:"#94a3b8",fontSize:9}} axisLine={false} tickLine={false}/>
+                  <YAxis hide/>
+                  <Tooltip formatter={v=>fmt(v)} contentStyle={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:8,fontFamily:"monospace",fontSize:10}}/>
+                  <Area type="monotone" dataKey="target" stroke="#cbd5e1" strokeWidth={1} strokeDasharray="4 4" fill="none" name="Goal"/>
+                  <Area type="monotone" dataKey="actual" stroke="#3b82f6" strokeWidth={2} fill="url(#cg)" dot={false} name="Actual"/>
+                </AreaChart>
+              </ResponsiveContainer>
+              <div className="hint" style={{marginTop:4}}>Blue = actual | Dashed = goal pace</div>
+            </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="chdr"><span className="ctit">Income Calendar</span><span className="cbdg">Click month for detail | Green = at or above goal</span></div>
+          <div className="calgrid">
+            {MN.map((m,i)=>{
+              const pc=mo[i]/mx; const at=mo[i]>=(target/12); const p=payers(i);
+              return (
+                <div key={m} className={"cal"+(active===i?" cala":"")+(i===now?" caln":"")} onClick={()=>setActive(active===i?null:i)}>
+                  <div style={{fontFamily:"monospace",fontSize:9,color:"#94a3b8",textTransform:"uppercase"}}>{m}</div>
+                  <div style={{flex:1,width:16,background:"#e2e8f0",borderRadius:3,position:"relative",minHeight:26,overflow:"hidden"}}>
+                    <div style={{position:"absolute",bottom:0,left:0,right:0,borderRadius:3,background:at?"#10b981":"#3b82f6",height:(pc*100)+"%",transition:"height .4s"}}/>
+                  </div>
+                  <div style={{fontFamily:"monospace",fontSize:9,fontWeight:600}}>{mo[i]>0?fmt(mo[i]):"--"}</div>
+                  <div style={{fontSize:8,color:"#94a3b8"}}>{p.length>0?p.length+"p":""}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        </>}
+
+        <div className="footer">Dividend Finder | {holdings.length} positions | {fmt(ann)} projected annual income | Your data stays in your browser</div>
       </div>
-    </div>
+
+      {modal&&<HoldingModal holding={modal==="add"?null:modal} onSave={saveH} onClose={()=>setModal(null)}/>}
+      {impModal&&<ImportModal rows={impModal} onConfirm={confirmImport} onClose={()=>setImpModal(null)}/>}
+    </>
   );
 }
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500&family=Outfit:wght@300;400;500;600;700;800&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:#f1f5f9;color:#1e293b;font-family:'Outfit',sans-serif;}
+.welcome{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 20px;background:linear-gradient(135deg,#f8faff,#f1f5f9,#eef2ff);}
+.wicon{font-size:52px;font-weight:900;color:#3b82f6;margin-bottom:12px;font-family:'Outfit',sans-serif;}
+.wtitle{font-size:32px;font-weight:800;text-align:center;line-height:1.2;margin-bottom:10px;letter-spacing:-.02em;}
+.wsub{font-size:15px;color:#64748b;text-align:center;max-width:440px;line-height:1.6;margin-bottom:32px;}
+.wsteps{display:flex;flex-direction:column;gap:12px;max-width:420px;width:100%;margin-bottom:28px;}
+.wstep{display:flex;align-items:flex-start;gap:12px;background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;}
+.wstep-hi{border-color:#3b82f6;background:#eff6ff;}
+.wnum{width:26px;height:26px;border-radius:50%;background:#3b82f6;color:#fff;font-weight:700;font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
+.wstep strong{display:block;font-weight:600;margin-bottom:2px;font-size:14px;}
+.wstep span{font-size:12px;color:#64748b;}
+.wbtns{display:flex;flex-direction:column;gap:10px;width:100%;max-width:380px;}
+.wbtn-import{background:#3b82f6;color:#fff;border:none;border-radius:12px;padding:13px 20px;font-family:'Outfit',sans-serif;font-weight:600;font-size:14px;cursor:pointer;transition:all .2s;}
+.wbtn-import:hover{background:#2563eb;}
+.wbtn-manual{background:#fff;color:#64748b;border:1px solid #cbd5e1;border-radius:12px;padding:11px 20px;font-family:'Outfit',sans-serif;font-weight:500;font-size:13px;cursor:pointer;transition:all .2s;}
+.wbtn-manual:hover{border-color:#3b82f6;color:#3b82f6;}
+.wprivacy{font-size:11px;color:#94a3b8;margin-top:16px;text-align:center;}
+.app{max-width:1300px;margin:0 auto;padding:16px 16px 40px;display:flex;flex-direction:column;gap:14px;}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 4px;border-bottom:2px solid #e2e8f0;flex-wrap:wrap;gap:10px;}
+.hleft{display:flex;align-items:center;gap:12px;}
+.logo{font-size:28px;font-weight:900;color:#3b82f6;}
+.title{font-size:18px;font-weight:800;letter-spacing:-.02em;}
+.sub{font-size:11px;color:#64748b;margin-top:1px;}
+.hright{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.navtabs{display:flex;gap:3px;background:#f1f5f9;border-radius:8px;padding:3px;margin-left:8px;}
+.ntab{background:none;border:none;border-radius:6px;padding:5px 13px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:600;cursor:pointer;color:#64748b;transition:all .15s;white-space:nowrap;}
+.ntab.active{background:#fff;color:#1e293b;box-shadow:0 1px 3px #0000001a;}
+.ntab:hover:not(.active){color:#1e293b;}
+.abtn{background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-family:'Outfit',sans-serif;font-weight:700;font-size:12px;cursor:pointer;}
+.ibtn{background:#fff;color:#1e293b;border:1px solid #cbd5e1;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-weight:600;font-size:12px;cursor:pointer;}
+.ibtn:hover{border-color:#3b82f6;color:#3b82f6;}
+.rbtn{background:#fff;color:#94a3b8;border:1px solid #e2e8f0;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-size:12px;cursor:pointer;}
+.lbtn{background:#fef3c7;color:#92400e;border:1px solid #fcd34d;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-weight:600;font-size:12px;cursor:pointer;}
+.bstat{font-family:'DM Mono',monospace;font-size:11px;color:#10b981;background:#f0fdf4;border:1px solid #bbf7d0;padding:4px 9px;border-radius:8px;}
+.goalbar{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+.goalleft{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.goallbl{font-size:12px;font-weight:600;color:#64748b;}
+.goalval{font-size:17px;font-weight:700;cursor:pointer;border-bottom:2px dashed #e2e8f0;padding-bottom:1px;}
+.goalval:hover{border-color:#3b82f6;}
+.goalinp{font-size:16px;font-weight:700;width:110px;border:2px solid #3b82f6;border-radius:6px;padding:2px 8px;font-family:'Outfit',sans-serif;outline:none;}
+.goalright{display:flex;align-items:center;gap:12px;flex:1;min-width:180px;}
+.goaltrack{flex:1;height:8px;background:#e2e8f0;border-radius:99px;overflow:hidden;}
+.goalfill{height:100%;border-radius:99px;transition:width .6s;}
+.goalpct{font-family:'DM Mono',monospace;font-size:11px;white-space:nowrap;font-weight:500;}
+.kpis{display:grid;grid-template-columns:repeat(7,1fr);gap:10px;}
+@media(max-width:1100px){.kpis{grid-template-columns:repeat(4,1fr);}}
+@media(max-width:700px){.kpis{grid-template-columns:repeat(3,1fr);}}
+@media(max-width:500px){.kpis{grid-template-columns:repeat(2,1fr);}}
+.kpi{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;}
+.klbl{font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#94a3b8;margin-bottom:5px;}
+.kval{font-family:'DM Mono',monospace;font-size:16px;font-weight:500;}
+.ksub{font-size:10px;color:#94a3b8;margin-top:3px;}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;box-shadow:0 1px 3px #0000000a;}
+.chdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:6px;}
+.ctit{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;}
+.cbdg{font-family:'DM Mono',monospace;font-size:10px;background:#f8fafc;border:1px solid #e2e8f0;color:#94a3b8;padding:3px 8px;border-radius:20px;}
+.hint{font-family:'DM Mono',monospace;font-size:10px;color:#94a3b8;text-align:center;}
+.mdet{margin-top:12px;border-top:1px solid #f1f5f9;padding-top:11px;}
+.mdhdr{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#64748b;margin-bottom:9px;font-family:'DM Mono',monospace;}
+.mdhdr strong{color:#1e293b;}
+.chips{display:flex;flex-wrap:wrap;gap:6px;}
+.chip{display:flex;align-items:center;gap:5px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:20px;padding:3px 9px;}
+.midrow{display:grid;grid-template-columns:1fr 275px;gap:14px;}
+@media(max-width:900px){.midrow{grid-template-columns:1fr;}}
+.tbl{width:100%;border-collapse:collapse;font-size:11px;}
+.tbl th{font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#94a3b8;text-align:left;padding:5px 7px;border-bottom:2px solid #f1f5f9;white-space:nowrap;}
+.tbl tr td{padding:7px 7px;border-bottom:1px solid #f8fafc;vertical-align:middle;}
+.tbl tr:last-child td{border-bottom:none;}
+.tbl tr:hover td{background:#f8fafc;}
+.sinp{background:#f8fafc;border:1px solid #e2e8f0;border-radius:5px;color:#1e293b;font-family:'DM Mono',monospace;font-size:11px;padding:3px 6px;width:85px;text-align:right;}
+.sinp:focus{outline:none;border-color:#3b82f6;}
+.rb{background:none;border:1px solid #e2e8f0;border-radius:5px;color:#94a3b8;cursor:pointer;padding:2px 8px;font-size:10px;font-family:'Outfit',sans-serif;}
+.rb:hover{border-color:#3b82f6;color:#3b82f6;}
+.rb.del:hover{border-color:#ef4444;color:#ef4444;}
+.calgrid{display:grid;grid-template-columns:repeat(12,1fr);gap:7px;}
+@media(max-width:700px){.calgrid{grid-template-columns:repeat(6,1fr);}}
+.cal{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px 5px;cursor:pointer;text-align:center;min-height:88px;display:flex;flex-direction:column;align-items:center;gap:3px;transition:all .15s;}
+.cal:hover{background:#eff6ff;border-color:#bfdbfe;}
+.cala{border-color:#3b82f6;background:#eff6ff;}
+.caln{border-color:#10b981;background:#f0fdf4;}
+.overlay{position:fixed;inset:0;background:#00000040;backdrop-filter:blur(4px);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px;}
+.mbox{background:#fff;border:1px solid #e2e8f0;border-radius:14px;width:100%;max-width:500px;padding:22px;max-height:90vh;overflow-y:auto;box-shadow:0 20px 60px #00000015;}
+.mhdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.mhdr h3{font-size:15px;font-weight:700;}
+.xbtn{background:none;border:1px solid #e2e8f0;border-radius:6px;color:#94a3b8;cursor:pointer;padding:4px 10px;font-size:13px;}
+.xbtn:hover{background:#f8fafc;}
+.lrow{display:flex;gap:8px;margin-bottom:6px;}
+.tkr{text-transform:uppercase;font-family:'DM Mono',monospace;font-weight:600;letter-spacing:.08em;}
+.aibtn{flex-shrink:0;background:#f59e0b;color:#000;border:none;border-radius:8px;padding:0 14px;font-family:'Outfit',sans-serif;font-weight:700;font-size:13px;cursor:pointer;}
+.aibtn:disabled{opacity:.4;cursor:not-allowed;}
+.ast{font-family:'DM Mono',monospace;font-size:10px;padding:4px 9px;border-radius:6px;margin-bottom:9px;}
+.ast.ok{background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0;}
+.ast.er{background:#fef2f2;color:#dc2626;border:1px solid #fecaca;}
+.fgrid{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:12px;}
+.fi{display:flex;flex-direction:column;gap:4px;}
+.fi.full{grid-column:span 2;}
+.fi label{font-family:'DM Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:#94a3b8;}
+.inp{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;color:#1e293b;font-family:'Outfit',sans-serif;font-size:13px;padding:8px 10px;width:100%;outline:none;transition:border-color .15s;}
+.inp:focus{border-color:#3b82f6;}
+.prev{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:9px 12px;font-family:'DM Mono',monospace;font-size:11px;color:#64748b;margin-bottom:12px;}
+.prev strong{color:#3b82f6;font-size:14px;}
+.mftr{display:flex;gap:8px;justify-content:flex-end;}
+.cbtn{background:none;border:1px solid #e2e8f0;border-radius:8px;color:#94a3b8;padding:8px 16px;font-family:'Outfit',sans-serif;font-size:12px;cursor:pointer;}
+.sbtn{background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:8px 18px;font-family:'Outfit',sans-serif;font-weight:700;font-size:13px;cursor:pointer;}
+.sbtn:disabled{opacity:.4;cursor:not-allowed;}
+.footer{text-align:center;font-family:'DM Mono',monospace;font-size:10px;color:#94a3b8;letter-spacing:.08em;padding-top:8px;border-top:1px solid #e2e8f0;}
+`;
