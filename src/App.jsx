@@ -1,14 +1,6 @@
 import { useState, useRef } from "react";
 
-// ─── ALL CODE BELOW IS IDENTICAL TO CALCULATOR ────────────────────────────────
-
-const SEC_TYPES = {
-  stock:     { label: "Stock",     color: "#3b82f6", bg: "#3b82f615" },
-  reit:      { label: "REIT",      color: "#8b5cf6", bg: "#8b5cf615" },
-  bond:      { label: "Bond/ETF",  color: "#06b6d4", bg: "#06b6d415" },
-  preferred: { label: "Preferred", color: "#10b981", bg: "#10b98115" },
-  cd:        { label: "MM/CD",     color: "#f59e0b", bg: "#f59e0b15" },
-};
+const API_BASE = 'https://dividend-api-production.up.railway.app';
 
 const FREQ = [
   { id:"monthly",    label:"Monthly",                     months:[1,2,3,4,5,6,7,8,9,10,11,12] },
@@ -20,8 +12,6 @@ const FREQ = [
   { id:"annual_dec", label:"Annual (December)",            months:[12] },
   { id:"annual_jun", label:"Annual (June)",                months:[6] },
 ];
-
-const MN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 const fmt = (n, d=0) => n == null ? "--" :
   new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",minimumFractionDigits:d,maximumFractionDigits:d}).format(n);
@@ -67,33 +57,20 @@ function getShares(row) {
   return key ? row[key] : "0";
 }
 
-// Exact aiLookup from calculator — not one character changed
-async function aiLookup(ticker, onResult, onError, onLoad) {
-  onLoad(true);
-  try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({
-        model:"claude-sonnet-4-20250514", max_tokens:400,
-        messages:[{role:"user",content:
-          'What is the current dividend per share per payment for "' + ticker + '"? ' +
-          'Also what is the payment frequency and security type? ' +
-          'Reply ONLY with raw JSON, no markdown: ' +
-          '{"name":"full name","type":"stock|reit|bond|preferred|cd","divPerShare":0.00,"freqId":"monthly|q_jan|q_feb|q_mar|semi_jan|semi_feb|annual_dec|annual_jun","notes":"brief"} ' +
-          'or {"error":"not found"}'
-        }]
-      })
-    });
-    const d = await r.json();
-    const txt = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("").replace(/```json|```/g,"").trim();
-    const j = JSON.parse(txt);
-    if (j.error) throw new Error(j.error);
-    onResult(j);
-  } catch(e) { onError(e.message||"Failed"); }
-  finally { onLoad(false); }
+// Uses Railway — same endpoint as calculator bulk lookup
+async function fetchDividends(tickers) {
+  if (!Array.isArray(tickers) || tickers.length === 0) throw new Error('tickers must be a non-empty array');
+  const response = await fetch(`${API_BASE}/dividends`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tickers }),
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.error || `HTTP ${response.status}`);
+  }
+  return response.json();
 }
-
-// ─── DIVIDEND FINDER — only difference from calculator: shows ONLY problem tickers ──
 
 function getCandidates(ticker) {
   const t = ticker.toUpperCase();
@@ -110,12 +87,12 @@ function getCandidates(ticker) {
 }
 
 export default function App() {
-  const [holdings, setHoldings]       = useState([]);
-  const [problems, setProblems]       = useState([]);
-  const [running, setRunning]         = useState(false);
-  const [bulkStatus, setBulkStatus]   = useState("");
-  const [done, setDone]               = useState(false);
-  const [rawText, setRawText]         = useState("");
+  const [holdings, setHoldings]     = useState([]);
+  const [problems, setProblems]     = useState([]);
+  const [running, setRunning]       = useState(false);
+  const [bulkStatus, setBulkStatus] = useState("");
+  const [done, setDone]             = useState(false);
+  const [rawText, setRawText]       = useState("");
   const fileRef = useRef();
 
   const handleFile = e => {
@@ -131,7 +108,6 @@ export default function App() {
           ticker: (r["Symbol"]||r["symbol"]||r["Ticker"]||"").replace(/\s/g,"").toUpperCase(),
           name: (r["Description"]||r["description"]||r["Name"]||r["Investment Name"]||"").trim(),
           shares: parseNum(getShares(r)),
-          type: "stock",
           divPerShare: 0,
           freqId: "q_mar",
           notes: "needs-lookup",
@@ -147,67 +123,69 @@ export default function App() {
     e.target.value = "";
   };
 
-  // Exact bulk lookup from calculator — runs all tickers, collects problems
   const bulkLookup = async () => {
     const missing = holdings.filter(h => !h.divPerShare || h.notes === "needs-lookup");
     if (!missing.length) { setDone(true); return; }
     setRunning(true);
-    const foundProblems = [];
-    let done_count = 0;
 
-    for (const h of missing) {
-      setBulkStatus(done_count + "/" + missing.length + " - looking up " + h.ticker + "...");
-      await new Promise(res => {
-        const timer = setTimeout(() => {
-          // Timed out — this is a problem ticker
-          foundProblems.push({ ...h, status: "red", suggestion: null, manualDiv: "", altTicker: "" });
-          done_count++; res();
-        }, 30000);
-        aiLookup(
-          h.ticker,
-          d => {
-            clearTimeout(timer);
-            // Found — update holdings silently, not shown to user
-            setHoldings(p => p.map(x => x.id === h.id ? {
-              ...x, ...d, ticker: x.ticker, shares: x.shares, notes: ""
-            } : x));
-            done_count++; res();
-          },
-          () => {
-            clearTimeout(timer);
-            // Error — problem ticker
-            foundProblems.push({ ...h, status: "red", suggestion: null, manualDiv: "", altTicker: "" });
-            done_count++; res();
-          },
-          () => {}
-        );
-      });
-      await new Promise(r => setTimeout(r, 300));
+    // Step 1: bulk fetch all tickers via Railway
+    setBulkStatus("Looking up " + missing.length + " tickers...");
+    const tickers = missing.map(h => h.ticker);
+    let data;
+    try {
+      data = await fetchDividends(tickers);
+    } catch(e) {
+      setBulkStatus("Error: " + e.message);
+      setRunning(false);
+      return;
     }
 
-    // Now silently try alternatives for each problem ticker
-    setBulkStatus("Resolving " + foundProblems.length + " problem ticker(s)...");
-    for (let i = 0; i < foundProblems.length; i++) {
-      const p = foundProblems[i];
-      const candidates = getCandidates(p.ticker);
-      let resolved = false;
-      for (const candidate of candidates) {
-        await new Promise(res => {
-          aiLookup(
-            candidate,
-            d => {
-              if (d.divPerShare > 0) {
-                foundProblems[i] = { ...p, status: "yellow", suggestion: { ticker: candidate, ...d } };
-                resolved = true;
-              }
-              res();
-            },
-            () => res(),
-            () => {}
-          );
-        });
-        if (resolved) break;
-        await new Promise(r => setTimeout(r, 200));
+    // Build result map
+    const resultMap = {};
+    (data.results || []).forEach(r => { resultMap[r.yahoo_symbol] = r; });
+
+    // Identify found vs problems
+    const foundProblems = [];
+    missing.forEach(h => {
+      const r = resultMap[h.ticker];
+      if (r && r.annual_income_per_share > 0 && r.payment_frequency > 0) {
+        // Found — update silently
+        setHoldings(p => p.map(x => x.id === h.id ? {
+          ...x, divPerShare: r.annual_income_per_share / r.payment_frequency,
+          freqId: r.freqId || "q_mar", notes: ""
+        } : x));
+      } else {
+        foundProblems.push({ ...h, status: "red", suggestion: null, manualDiv: "", altTicker: "" });
+      }
+    });
+
+    // Step 2: for each problem, silently try candidates via Railway
+    if (foundProblems.length > 0) {
+      setBulkStatus("Resolving " + foundProblems.length + " problem ticker(s)...");
+      for (let i = 0; i < foundProblems.length; i++) {
+        const p = foundProblems[i];
+        const candidates = getCandidates(p.ticker);
+        let resolved = false;
+        for (const candidate of candidates) {
+          try {
+            const cd = await fetchDividends([candidate]);
+            const r = (cd.results || [])[0];
+            if (r && r.annual_income_per_share > 0 && r.payment_frequency > 0) {
+              foundProblems[i] = {
+                ...p, status: "yellow",
+                suggestion: {
+                  ticker: candidate,
+                  divPerShare: r.annual_income_per_share / r.payment_frequency,
+                  freqId: r.freqId || "q_mar",
+                  annualPerShare: r.annual_income_per_share,
+                }
+              };
+              resolved = true;
+              break;
+            }
+          } catch { /* try next */ }
+        }
+        if (!resolved) foundProblems[i] = { ...p, status: "red" };
       }
     }
 
@@ -220,10 +198,10 @@ export default function App() {
   const acceptSuggestion = id => {
     setProblems(p => p.map(x => {
       if (x.id !== id || !x.suggestion) return x;
-      // Update the holding with the confirmed ticker and dividend
       setHoldings(h => h.map(hx => hx.id === id ? {
-        ...hx, ticker: x.suggestion.ticker, divPerShare: x.suggestion.divPerShare,
-        freqId: x.suggestion.freqId, type: x.suggestion.type, notes: ""
+        ...hx, ticker: x.suggestion.ticker,
+        divPerShare: x.suggestion.divPerShare,
+        freqId: x.suggestion.freqId, notes: ""
       } : hx));
       return { ...x, status: "green", altTicker: x.suggestion.ticker };
     }));
@@ -248,12 +226,8 @@ export default function App() {
       const low = lines[i].replace(/"/g,"").toLowerCase();
       if (low.startsWith("symbol") || low.includes(",symbol,")) { hi = i; break; }
     }
-    // Build ticker map — use accepted alternative tickers where applicable
     const tickerMap = {};
-    holdings.forEach(h => { tickerMap[h.ticker] = h.ticker; });
-    problems.forEach(p => {
-      if (p.altTicker) tickerMap[p.ticker] = p.altTicker;
-    });
+    problems.forEach(p => { if (p.altTicker) tickerMap[p.ticker] = p.altTicker; });
     const head = lines.slice(0, hi+1).join("\n");
     const body = lines.slice(hi+1).filter(l => l.trim()).map(l => {
       const sym = l.split(",")[0].replace(/"/g,"").trim().toUpperCase();
@@ -292,7 +266,6 @@ export default function App() {
         .bstat{font-family:'DM Mono',monospace;font-size:11px;color:#10b981;background:#f0fdf4;border:1px solid #bbf7d0;padding:4px 9px;border-radius:8px}
       `}</style>
 
-      {/* Header — same as calculator */}
       <div style={{background:"#fff",borderBottom:"2px solid #e2e8f0",padding:"14px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <div style={{fontSize:28,fontWeight:900,color:"#10b981"}}>$</div>
@@ -308,12 +281,8 @@ export default function App() {
             </button>
           )}
           {bulkStatus && <span className="bstat">{bulkStatus}</span>}
-          {holdings.length > 0 && (
-            <button className="ibtn" onClick={() => fileRef.current?.click()}>Import CSV</button>
-          )}
-          {holdings.length > 0 && (
-            <button className="rbtn" onClick={() => {setHoldings([]);setProblems([]);setDone(false);}}>Reset</button>
-          )}
+          {holdings.length > 0 && <button className="ibtn" onClick={() => fileRef.current?.click()}>Import CSV</button>}
+          {holdings.length > 0 && <button className="rbtn" onClick={() => {setHoldings([]);setProblems([]);setDone(false);}}>Reset</button>}
         </div>
       </div>
 
@@ -338,7 +307,6 @@ export default function App() {
           </div>
 
         ) : problems.length === 0 ? (
-          // All clean — no problems found
           <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:12,padding:"32px",textAlign:"center"}}>
             <div style={{fontSize:40,marginBottom:12}}>✅</div>
             <div style={{fontWeight:700,fontSize:20,color:"#15803d",marginBottom:8}}>All {holdings.length} tickers confirmed</div>
@@ -347,7 +315,6 @@ export default function App() {
           </div>
 
         ) : (
-          // Show only problem tickers
           <>
             <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:10,padding:"14px 18px",marginBottom:20,display:"flex",gap:12,alignItems:"flex-start"}}>
               <span style={{fontSize:20,flexShrink:0}}>⚠️</span>
@@ -381,7 +348,6 @@ export default function App() {
                     <div style={{fontSize:12,color:"#94a3b8",fontFamily:"'DM Mono',monospace"}}>{p.shares.toLocaleString()} shares</div>
                   </div>
 
-                  {/* Yellow — pre-verified suggestion */}
                   {p.status === "yellow" && p.suggestion && (
                     <div style={{marginTop:14,background:"#f0fdf4",border:"1px solid #10b98133",borderRadius:8,padding:"12px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
                       <div style={{fontSize:13}}>
@@ -391,8 +357,6 @@ export default function App() {
                         <span style={{margin:"0 8px",color:"#e2e8f0"}}>·</span>
                         <span style={{fontFamily:"'DM Mono',monospace",color:"#10b981"}}>{fmt(p.suggestion.divPerShare,4)}/pmt</span>
                         <span style={{margin:"0 8px",color:"#e2e8f0"}}>·</span>
-                        <span style={{color:"#64748b",fontSize:12}}>{p.suggestion.freqId}</span>
-                        <span style={{margin:"0 8px",color:"#e2e8f0"}}>·</span>
                         <span style={{fontSize:11,color:"#10b981"}}>pre-verified ✓</span>
                       </div>
                       <button className="accept-btn" onClick={() => acceptSuggestion(p.id)}>
@@ -401,24 +365,15 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Red — no suggestion found, manual entry */}
                   {p.status === "red" && (
                     <div style={{marginTop:14,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
                       <span style={{fontSize:13,color:"#64748b"}}>Enter dividend per payment manually:</span>
-                      <input
-                        className="manual-inp"
-                        type="number" min="0" step="0.0001"
-                        placeholder="e.g. 0.3438"
-                        value={p.manualDiv}
-                        onChange={e => setManualDiv(p.id, e.target.value)}
-                      />
-                      {p.manualDiv && parseFloat(p.manualDiv) > 0 && (
-                        <span style={{fontSize:12,color:"#10b981"}}>✓ Will be applied</span>
-                      )}
+                      <input className="manual-inp" type="number" min="0" step="0.0001" placeholder="e.g. 0.3438"
+                        value={p.manualDiv} onChange={e => setManualDiv(p.id, e.target.value)}/>
+                      {p.manualDiv && parseFloat(p.manualDiv) > 0 && <span style={{fontSize:12,color:"#10b981"}}>✓ Will be applied</span>}
                     </div>
                   )}
 
-                  {/* Green — resolved */}
                   {p.status === "green" && (
                     <div style={{marginTop:10,fontSize:12,color:"#15803d",fontFamily:"'DM Mono',monospace"}}>
                       ✓ Resolved — {p.altTicker ? `using ${p.altTicker}` : `manual entry: ${fmt(parseFloat(p.manualDiv),4)}/pmt`}
