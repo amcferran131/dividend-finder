@@ -350,7 +350,7 @@ export default function App() {
     }
     clearInterval(blink);
     setHoldings(updated);
-    const problems = updated.filter(h=>!h.divPerShare||h.notes==="needs-lookup");
+    const problems = updated.filter(h=>h.notes==="needs-lookup");
     if (problems.length===0) {
       setAppState("confirmed");
     } else {
