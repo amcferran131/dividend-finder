@@ -350,17 +350,25 @@ const CONF_STYLE = {
   red:    { bg:"#fef2f2", border:"#fca5a5", badge:"#991b1b", badgeBg:"#fee2e2", label:"Low"  },
 };
 
-function ProblemsView({holdings, onApplySuggestion, onRetryAll}) {
+function ProblemsView({holdings, onApplySuggestion, onRetryAll, onGoToDashboard}) {
   const problems = holdings.filter(h => h.lookupError);
   const [trying, setTrying] = useState({});
   const [tryResult, setTryResult] = useState({});
 
   if (problems.length === 0) {
     return (
-      <div className="card" style={{textAlign:"center",padding:40}}>
-        <div style={{fontSize:40,marginBottom:12}}>✓</div>
-        <div style={{fontWeight:700,fontSize:16,marginBottom:6}}>No problem tickers</div>
-        <div style={{fontSize:13,color:"#64748b"}}>All positions resolved successfully.</div>
+      <div className="card" style={{textAlign:"center",padding:48}}>
+        <div style={{fontSize:48,marginBottom:12}}>✅</div>
+        <div style={{fontWeight:800,fontSize:20,marginBottom:8,color:"#10b981"}}>All Positions Resolved</div>
+        <div style={{fontSize:14,color:"#64748b",marginBottom:32}}>All tickers confirmed successfully. Your income data is ready.</div>
+        <button
+          onClick={onGoToDashboard}
+          style={{background:"#10b981",color:"#fff",border:"none",borderRadius:12,padding:"14px 32px",fontFamily:"'Outfit',sans-serif",fontWeight:700,fontSize:16,cursor:"pointer",boxShadow:"0 4px 14px #10b98133",transition:"all .2s"}}
+          onMouseOver={e=>e.target.style.background="#059669"}
+          onMouseOut={e=>e.target.style.background="#10b981"}
+        >
+          View Income Dashboard →
+        </button>
       </div>
     );
   }
@@ -709,7 +717,7 @@ export default function App() {
         </header>
 
         {view==="schedule"&&<PaymentSchedule holdings={holdings}/>}
-        {view==="problems"&&<ProblemsView holdings={holdings} onApplySuggestion={applySuggestion} onRetryAll={bulkLookup}/>}
+        {view==="problems"&&<ProblemsView holdings={holdings} onApplySuggestion={applySuggestion} onRetryAll={bulkLookup} onGoToDashboard={()=>setView("dashboard")}/>}
 
         {view==="dashboard"&&<><div className="goalbar">
           <div className="goalleft">
