@@ -22,7 +22,6 @@ const FREQ = [
 
 const MN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
-
 const fmt = (n, d=0) => n == null ? "--" :
   new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",minimumFractionDigits:d,maximumFractionDigits:d}).format(n);
 
@@ -69,6 +68,51 @@ function getShares(row) {
   return key ? row[key] : "0";
 }
 
+// ── Suggestion engine ──────────────────────────────────────────────────────
+function generateSuggestions(ticker) {
+  const t = ticker.toUpperCase();
+  const suggestions = [];
+
+  // BASE/PRA, BASE/PRB, etc. → try BASE/PR (e.g. RLJ/PRA → RLJ/PR ✓ confirmed working)
+  const slashPRSeries = t.match(/^(.+)\/PR([A-Z])$/);
+  if (slashPRSeries) {
+    const [, base, series] = slashPRSeries;
+    suggestions.push({ ticker: base + "/PR",       confidence: "green",  reason: "Drop series letter → " + base + "/PR" });
+    suggestions.push({ ticker: base + "P" + series, confidence: "yellow", reason: "Concatenated → " + base + "P" + series });
+    suggestions.push({ ticker: base,                confidence: "red",    reason: "Common stock → " + base });
+    return suggestions;
+  }
+
+  // BASE-PRA, BASE-PRB
+  const dashPRSeries = t.match(/^(.+)-PR([A-Z])$/);
+  if (dashPRSeries) {
+    const [, base, series] = dashPRSeries;
+    suggestions.push({ ticker: base + "/PR",       confidence: "green",  reason: "Slash format → " + base + "/PR" });
+    suggestions.push({ ticker: base + "P" + series, confidence: "yellow", reason: "No separator → " + base + "P" + series });
+    suggestions.push({ ticker: base,                confidence: "red",    reason: "Common stock → " + base });
+    return suggestions;
+  }
+
+  // BASE/PR (no series letter) — e.g. DCOM/PR → DCOMP
+  const slashPRBase = t.match(/^(.+)\/PR$/);
+  if (slashPRBase) {
+    const [, base] = slashPRBase;
+    suggestions.push({ ticker: base + "P",  confidence: "green",  reason: "Concatenated → " + base + "P" });
+    suggestions.push({ ticker: base + "PA", confidence: "yellow", reason: "Series A → " + base + "PA" });
+    suggestions.push({ ticker: base,        confidence: "red",    reason: "Common stock → " + base });
+    return suggestions;
+  }
+
+  // Generic fallback
+  const noSep = t.replace(/[/\-.]/g, "");
+  if (noSep !== t) suggestions.push({ ticker: noSep, confidence: "green", reason: "Remove separators → " + noSep });
+  const baseOnly = t.replace(/[/\-.]?P[RA-Z]?$/i, "");
+  if (baseOnly !== t && baseOnly !== noSep) suggestions.push({ ticker: baseOnly, confidence: "yellow", reason: "Base ticker → " + baseOnly });
+  while (suggestions.length < 3) suggestions.push({ ticker: "", confidence: "red", reason: "Manual entry needed" });
+  return suggestions.slice(0, 3);
+}
+
+// ── Railway lookup ─────────────────────────────────────────────────────────
 async function aiLookup(ticker, onResult, onError, onLoad) {
   onLoad(true);
   try {
@@ -113,6 +157,7 @@ function calcTypes(holdings) {
   })).filter(d=>d.value>0).sort((a,b)=>b.value-a.value);
 }
 
+// ── HoldingModal ───────────────────────────────────────────────────────────
 function HoldingModal({holding, onSave, onClose}) {
   const [f, setF] = useState(holding||{ticker:"",name:"",type:"stock",shares:"",divPerShare:"",freqId:"q_mar",notes:""});
   const [st, setSt] = useState(""); const [ld, setLd] = useState(false);
@@ -160,6 +205,7 @@ function HoldingModal({holding, onSave, onClose}) {
   );
 }
 
+// ── ImportModal ────────────────────────────────────────────────────────────
 function ImportModal({rows, onConfirm, onClose}) {
   const [sel, setSel] = useState(rows.map(r=>({...r,_on:true})));
   const tog = i => setSel(p=>p.map(r=>r._idx===i?{...r,_on:!r._on}:r));
@@ -198,6 +244,7 @@ function ImportModal({rows, onConfirm, onClose}) {
   );
 }
 
+// ── PaymentSchedule ────────────────────────────────────────────────────────
 function PaymentSchedule({holdings}) {
   const now = new Date();
   const thisM = now.getMonth();
@@ -252,7 +299,6 @@ function PaymentSchedule({holdings}) {
     <div style={{display:"flex",flexDirection:"column",gap:14}}>
       <MonthCard label={`This Month — ${MN[thisM]} ${now.getFullYear()}`} mi={thisM} accent={true}/>
       <MonthCard label={`Next Month — ${MN[nextM]} ${nextM<thisM?now.getFullYear()+1:now.getFullYear()}`} mi={nextM} accent={false}/>
-
       <div className="card">
         <div className="chdr"><span className="ctit">Full Year Payment Schedule</span><span className="cbdg">Estimated dates based on last known payment</span></div>
         <div style={{display:"flex",flexDirection:"column",gap:20}}>
@@ -297,6 +343,118 @@ function PaymentSchedule({holdings}) {
   );
 }
 
+// ── ProblemsView ───────────────────────────────────────────────────────────
+const CONF_STYLE = {
+  green:  { bg:"#f0fdf4", border:"#86efac", badge:"#16a34a", badgeBg:"#dcfce7", label:"High" },
+  yellow: { bg:"#fffbeb", border:"#fcd34d", badge:"#92400e", badgeBg:"#fef3c7", label:"Med"  },
+  red:    { bg:"#fef2f2", border:"#fca5a5", badge:"#991b1b", badgeBg:"#fee2e2", label:"Low"  },
+};
+
+function ProblemsView({holdings, onApplySuggestion, onRetryAll}) {
+  const problems = holdings.filter(h => h.lookupError);
+  const [trying, setTrying] = useState({});
+  const [tryResult, setTryResult] = useState({});
+
+  if (problems.length === 0) {
+    return (
+      <div className="card" style={{textAlign:"center",padding:40}}>
+        <div style={{fontSize:40,marginBottom:12}}>✓</div>
+        <div style={{fontWeight:700,fontSize:16,marginBottom:6}}>No problem tickers</div>
+        <div style={{fontSize:13,color:"#64748b"}}>All positions resolved successfully.</div>
+      </div>
+    );
+  }
+
+  const trySuggestion = (holding, sugTicker) => {
+    if (!sugTicker) return;
+    setTrying(p=>({...p,[holding.id]:sugTicker}));
+    setTryResult(p=>({...p,[holding.id]:null}));
+    aiLookup(
+      sugTicker,
+      data => {
+        setTrying(p=>({...p,[holding.id]:null}));
+        setTryResult(p=>({...p,[holding.id]:{ok:true,msg:"Found! Applying..."}}));
+        onApplySuggestion(holding.id, sugTicker, data);
+      },
+      err => {
+        setTrying(p=>({...p,[holding.id]:null}));
+        setTryResult(p=>({...p,[holding.id]:{ok:false,msg:"Failed: "+err}}));
+      },
+      ()=>{}
+    );
+  };
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <div className="card" style={{background:"#fef2f2",borderColor:"#fca5a5"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
+          <div>
+            <div style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"#991b1b",textTransform:"uppercase",letterSpacing:".1em",marginBottom:4}}>Problem Tickers</div>
+            <div style={{fontSize:22,fontWeight:800,color:"#1e293b"}}>{problems.length} position{problems.length!==1?"s":""} need attention</div>
+            <div style={{fontSize:12,color:"#64748b",marginTop:3}}>Click a suggestion to test and apply. Green = highest confidence.</div>
+          </div>
+          <button className="lbtn" onClick={onRetryAll} style={{whiteSpace:"nowrap"}}>Retry All Lookups</button>
+        </div>
+      </div>
+
+      {problems.map(h => {
+        const suggs = h.suggestions || generateSuggestions(h.ticker);
+        const isTrying = trying[h.id];
+        const result = tryResult[h.id];
+        return (
+          <div key={h.id} className="card" style={{borderLeft:"4px solid #ef4444"}}>
+            <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:14,flexWrap:"wrap",gap:8}}>
+              <div>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                  <span style={{fontFamily:"'DM Mono',monospace",fontWeight:700,fontSize:18,color:"#1e293b"}}>{h.ticker}</span>
+                  <span style={{background:"#fee2e2",color:"#991b1b",fontFamily:"monospace",fontSize:10,padding:"2px 8px",borderRadius:20,fontWeight:700}}>UNRESOLVED</span>
+                </div>
+                <div style={{fontSize:12,color:"#64748b",marginBottom:4}}>{h.name}</div>
+                <div style={{fontFamily:"'DM Mono',monospace",fontSize:10,color:"#ef4444",background:"#fef2f2",border:"1px solid #fca5a5",borderRadius:6,padding:"3px 8px",display:"inline-block"}}>
+                  {h.lookupError}
+                </div>
+              </div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:11,color:"#64748b",textAlign:"right"}}>
+                <div>{(h.shares||0).toLocaleString()} shares</div>
+              </div>
+            </div>
+
+            <div>
+              <div style={{fontFamily:"'DM Mono',monospace",fontSize:9,textTransform:"uppercase",letterSpacing:".1em",color:"#94a3b8",marginBottom:8}}>3 Suggested Replacements</div>
+              <div style={{display:"flex",flexDirection:"column",gap:7}}>
+                {suggs.map((sg, idx) => {
+                  const cs = CONF_STYLE[sg.confidence];
+                  const isThisTrying = isTrying === sg.ticker;
+                  return (
+                    <div key={idx}
+                      style={{display:"flex",alignItems:"center",gap:10,background:cs.bg,border:`1px solid ${cs.border}`,borderRadius:8,padding:"10px 12px",cursor:sg.ticker?"pointer":"default",opacity:sg.ticker?1:0.45,transition:"opacity .15s"}}
+                      onClick={()=>!isThisTrying&&sg.ticker&&trySuggestion(h,sg.ticker)}
+                    >
+                      <span style={{background:cs.badgeBg,color:cs.badge,fontFamily:"monospace",fontSize:9,fontWeight:700,padding:"2px 7px",borderRadius:20,flexShrink:0,minWidth:36,textAlign:"center"}}>{cs.label}</span>
+                      <span style={{fontFamily:"'DM Mono',monospace",fontWeight:700,fontSize:14,color:"#1e293b",flexShrink:0,minWidth:88}}>{sg.ticker||"—"}</span>
+                      <span style={{fontSize:11,color:"#64748b",flex:1}}>{sg.reason}</span>
+                      <span style={{fontFamily:"monospace",fontSize:11,color:cs.badge,flexShrink:0}}>
+                        {isThisTrying ? "Testing..." : sg.ticker ? "Click to apply →" : ""}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {result && (
+              <div style={{marginTop:10,fontFamily:"'DM Mono',monospace",fontSize:11,padding:"6px 10px",borderRadius:6,background:result.ok?"#f0fdf4":"#fef2f2",color:result.ok?"#16a34a":"#dc2626",border:`1px solid ${result.ok?"#86efac":"#fca5a5"}`}}>
+                {result.msg}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Welcome ────────────────────────────────────────────────────────────────
 function Welcome({onImport, onManual, fileRef}) {
   return (
     <div className="welcome">
@@ -312,6 +470,7 @@ function Welcome({onImport, onManual, fileRef}) {
   );
 }
 
+// ── Main App ───────────────────────────────────────────────────────────────
 export default function App() {
   const [holdings, setHoldings] = useState([]);
   const [view, setView] = useState("dashboard");
@@ -335,14 +494,19 @@ export default function App() {
     for (let i = 0; i < holdingsList.length; i++) {
       const h = holdingsList[i];
       await new Promise(res=>{
-        const timer = setTimeout(()=>res(), 30000);
+        const timer = setTimeout(()=>{ res(); }, 30000);
         aiLookup(h.ticker,
           d=>{
             clearTimeout(timer);
-            updated = updated.map(x=>x.id===h.id?{...x,...d,ticker:x.ticker,shares:x.shares,notes:""}:x);
+            updated = updated.map(x=>x.id===h.id?{...x,...d,ticker:x.ticker,shares:x.shares,notes:"",lookupError:null,suggestions:null}:x);
             res();
           },
-          ()=>{ clearTimeout(timer); res(); },
+          err=>{
+            clearTimeout(timer);
+            const suggs = generateSuggestions(h.ticker);
+            updated = updated.map(x=>x.id===h.id?{...x,notes:"error",lookupError:err,suggestions:suggs}:x);
+            res();
+          },
           ()=>{}
         );
       });
@@ -350,11 +514,12 @@ export default function App() {
     }
     clearInterval(blink);
     setHoldings(updated);
-    const problems = updated.filter(h=>h.notes==="needs-lookup");
-    if (problems.length===0) {
+    const problems = updated.filter(h=>h.lookupError);
+    if (problems.length === 0) {
       setAppState("confirmed");
     } else {
       setAppState("dashboard");
+      setView("problems");
     }
   };
 
@@ -409,29 +574,49 @@ export default function App() {
   };
 
   const bulkLookup = async () => {
-    const missing = holdings.filter(h=>h.notes==="needs-lookup");
+    const missing = holdings.filter(h=>h.notes==="needs-lookup"||h.lookupError);
     if (!missing.length) { setBulkStatus("All positions have rates."); setTimeout(()=>setBulkStatus(""),3000); return; }
     setBulkRunning(true);
-    let done=0;
+    let done=0, errs=0;
     for (const h of missing) {
       setBulkStatus(done+"/"+missing.length+" - looking up "+h.ticker+"...");
       await new Promise(res=>{
-        const timer = setTimeout(()=>{ done++; res(); }, 30000);
+        const timer = setTimeout(()=>{ done++; errs++; res(); }, 30000);
         aiLookup(h.ticker,
           d=>{
             clearTimeout(timer);
-            setHoldings(p=>p.map(x=>x.id===h.id?{...x,...d,ticker:x.ticker,shares:x.shares,notes:""}:x));
+            setHoldings(p=>p.map(x=>x.id===h.id?{...x,...d,ticker:x.ticker,shares:x.shares,notes:"",lookupError:null,suggestions:null}:x));
             done++; res();
           },
-          ()=>{ clearTimeout(timer); done++; res(); },
+          err=>{
+            clearTimeout(timer);
+            const suggs = generateSuggestions(h.ticker);
+            setHoldings(p=>p.map(x=>x.id===h.id?{...x,notes:"error",lookupError:err,suggestions:suggs}:x));
+            done++; errs++; res();
+          },
           ()=>{}
         );
       });
       await new Promise(r=>setTimeout(r,300));
     }
     setBulkRunning(false);
-    setBulkStatus("Done - "+done+"/"+missing.length+" updated");
-    setTimeout(()=>setBulkStatus(""),5000);
+    if (errs > 0) {
+      setBulkStatus(errs+" problem"+(errs>1?"s":"")+" found");
+      setView("problems");
+    } else {
+      setBulkStatus("Done - "+done+"/"+missing.length+" updated");
+    }
+    setTimeout(()=>setBulkStatus(""),8000);
+  };
+
+  const applySuggestion = (holdingId, newTicker, data) => {
+    setHoldings(p=>p.map(h=>h.id===holdingId?{
+      ...h,...data,
+      ticker: newTicker,
+      notes: "",
+      lookupError: null,
+      suggestions: null,
+    }:h));
   };
 
   const mo = calcMonthly(holdings);
@@ -443,6 +628,7 @@ export default function App() {
   const now = new Date().getMonth();
   const gap = ann-target;
   const needsLookup = holdings.filter(h=>h.notes==="needs-lookup").length;
+  const problemCount = holdings.filter(h=>h.lookupError).length;
   const mktVal = holdings.reduce((a,h)=>a+(h.price||0)*h.shares,0);
 
   const barD = MN.map((m,i)=>({month:m,income:+mo[i].toFixed(2)}));
@@ -508,11 +694,14 @@ export default function App() {
             <div className="navtabs">
               <button className={"ntab"+(view==="dashboard"?" active":"")} onClick={()=>setView("dashboard")}>Dashboard</button>
               <button className={"ntab"+(view==="schedule"?" active":"")} onClick={()=>setView("schedule")}>Payment Schedule</button>
+              <button className={"ntab"+(view==="problems"?" active":"")+(problemCount>0?" ntab-warn":"")} onClick={()=>setView("problems")}>
+                Problems{problemCount>0&&<span className="pbadge">{problemCount}</span>}
+              </button>
             </div>
           </div>
           <div className="hright">
-            {needsLookup>0&&<button className="lbtn" onClick={bulkLookup} disabled={bulkRunning}>{bulkRunning?"Running...":"Lookup "+needsLookup+" rates"}</button>}
-            {bulkStatus&&<span className="bstat">{bulkStatus}</span>}
+            {(needsLookup>0||problemCount>0)&&<button className="lbtn" onClick={bulkLookup} disabled={bulkRunning}>{bulkRunning?"Running...":"Lookup "+(needsLookup+problemCount)+" rates"}</button>}
+            {bulkStatus&&<span className={"bstat"+(bulkStatus.includes("problem")?" bstat-err":"")}>{bulkStatus}</span>}
             <button className="ibtn" onClick={()=>fileRef.current&&fileRef.current.click()}>Import CSV</button>
             <button className="abtn" onClick={()=>setModal("add")}>+ Add</button>
             <button className="rbtn" onClick={()=>{setHoldings([]);setView("dashboard");setAppState("welcome");}}>Reset</button>
@@ -520,6 +709,7 @@ export default function App() {
         </header>
 
         {view==="schedule"&&<PaymentSchedule holdings={holdings}/>}
+        {view==="problems"&&<ProblemsView holdings={holdings} onApplySuggestion={applySuggestion} onRetryAll={bulkLookup}/>}
 
         {view==="dashboard"&&<><div className="goalbar">
           <div className="goalleft">
@@ -605,11 +795,18 @@ export default function App() {
                     const fr=FREQ.find(f=>f.id===h.freqId);
                     const an=h.shares*h.divPerShare*(fr?.months.length||12);
                     const ti=SEC_TYPES[h.type];
-                    const flag=h.notes==="needs-lookup";
+                    const needsL=h.notes==="needs-lookup";
+                    const hasErr=!!h.lookupError;
                     const mv=h.price!=null?h.price*h.shares:null;
                     return (
-                      <tr key={h.id} style={{background:flag?"#fffbeb":""}}>
-                        <td><div style={{display:"flex",alignItems:"center",gap:5}}><span style={{width:6,height:6,borderRadius:"50%",background:ti?.color,display:"inline-block",flexShrink:0}}/><span style={{fontFamily:"monospace",fontWeight:600,fontSize:11}}>{h.ticker}{flag&&<span style={{color:"#f59e0b",fontSize:9,marginLeft:2}}>!</span>}</span></div></td>
+                      <tr key={h.id} style={{background:hasErr?"#fef2f2":needsL?"#fffbeb":""}}>
+                        <td><div style={{display:"flex",alignItems:"center",gap:5}}>
+                          <span style={{width:6,height:6,borderRadius:"50%",background:hasErr?"#ef4444":ti?.color,display:"inline-block",flexShrink:0}}/>
+                          <span style={{fontFamily:"monospace",fontWeight:600,fontSize:11}}>{h.ticker}
+                            {hasErr&&<span style={{color:"#ef4444",fontSize:9,marginLeft:2}}>✕</span>}
+                            {needsL&&!hasErr&&<span style={{color:"#f59e0b",fontSize:9,marginLeft:2}}>!</span>}
+                          </span>
+                        </div></td>
                         <td><div style={{fontSize:10,color:"#64748b",maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{h.name}</div></td>
                         <td><span style={{background:ti?.bg,color:ti?.color,fontFamily:"monospace",fontSize:9,padding:"2px 6px",borderRadius:20}}>{ti?.label}</span></td>
                         <td><input className="sinp" type="number" min="0" step="0.01" value={h.shares} onChange={e=>updS(h.id,e.target.value)}/></td>
@@ -617,8 +814,11 @@ export default function App() {
                         <td style={{fontFamily:"monospace",fontSize:10}}>{mv!=null?fmt(mv):"--"}</td>
                         <td style={{fontFamily:"monospace",fontSize:10}}>{h.divPerShare>0?fmt(h.divPerShare,4):"--"}</td>
                         <td style={{fontSize:9,color:"#64748b",whiteSpace:"nowrap"}}>{fr?.label.split(" (")[0]}</td>
-                        <td style={{fontFamily:"monospace",fontSize:10,color:an>0?"#10b981":"#94a3b8"}}>{an>0?fmt(an):"No Dividend"}</td>
+                        <td style={{fontFamily:"monospace",fontSize:10,color:an>0?"#10b981":hasErr?"#ef4444":"#94a3b8"}}>
+                          {an>0?fmt(an):hasErr?"Fix needed":"No Dividend"}
+                        </td>
                         <td><div style={{display:"flex",gap:3}}>
+                          {hasErr&&<button className="rb" style={{color:"#ef4444",borderColor:"#fca5a5"}} onClick={()=>setView("problems")}>Fix</button>}
                           <button className="rb" onClick={()=>setModal(h)}>Edit</button>
                           <button className="rb del" onClick={()=>delH(h.id)}>X</button>
                         </div></td>
@@ -707,12 +907,6 @@ body{background:#f1f5f9;color:#1e293b;font-family:'Outfit',sans-serif;}
 .wicon{font-size:52px;font-weight:900;color:#3b82f6;margin-bottom:12px;font-family:'Outfit',sans-serif;}
 .wtitle{font-size:32px;font-weight:800;text-align:center;line-height:1.2;margin-bottom:10px;letter-spacing:-.02em;}
 .wsub{font-size:15px;color:#64748b;text-align:center;max-width:440px;line-height:1.6;margin-bottom:32px;}
-.wsteps{display:flex;flex-direction:column;gap:12px;max-width:420px;width:100%;margin-bottom:28px;}
-.wstep{display:flex;align-items:flex-start;gap:12px;background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;}
-.wstep-hi{border-color:#3b82f6;background:#eff6ff;}
-.wnum{width:26px;height:26px;border-radius:50%;background:#3b82f6;color:#fff;font-weight:700;font-size:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
-.wstep strong{display:block;font-weight:600;margin-bottom:2px;font-size:14px;}
-.wstep span{font-size:12px;color:#64748b;}
 .wbtns{display:flex;flex-direction:column;gap:10px;width:100%;max-width:380px;}
 .wbtn-import{background:#3b82f6;color:#fff;border:none;border-radius:12px;padding:13px 20px;font-family:'Outfit',sans-serif;font-weight:600;font-size:14px;cursor:pointer;transition:all .2s;}
 .wbtn-import:hover{background:#2563eb;}
@@ -727,15 +921,19 @@ body{background:#f1f5f9;color:#1e293b;font-family:'Outfit',sans-serif;}
 .sub{font-size:11px;color:#64748b;margin-top:1px;}
 .hright{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .navtabs{display:flex;gap:3px;background:#f1f5f9;border-radius:8px;padding:3px;margin-left:8px;}
-.ntab{background:none;border:none;border-radius:6px;padding:5px 13px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:600;cursor:pointer;color:#64748b;transition:all .15s;white-space:nowrap;}
+.ntab{background:none;border:none;border-radius:6px;padding:5px 13px;font-family:'Outfit',sans-serif;font-size:12px;font-weight:600;cursor:pointer;color:#64748b;transition:all .15s;white-space:nowrap;display:flex;align-items:center;gap:5px;}
 .ntab.active{background:#fff;color:#1e293b;box-shadow:0 1px 3px #0000001a;}
 .ntab:hover:not(.active){color:#1e293b;}
+.ntab-warn{color:#dc2626 !important;}
+.ntab-warn.active{background:#fff;color:#dc2626 !important;}
+.pbadge{background:#ef4444;color:#fff;font-size:9px;font-weight:700;border-radius:99px;padding:1px 6px;font-family:'DM Mono',monospace;line-height:1.4;}
 .abtn{background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-family:'Outfit',sans-serif;font-weight:700;font-size:12px;cursor:pointer;}
 .ibtn{background:#fff;color:#1e293b;border:1px solid #cbd5e1;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-weight:600;font-size:12px;cursor:pointer;}
 .ibtn:hover{border-color:#3b82f6;color:#3b82f6;}
 .rbtn{background:#fff;color:#94a3b8;border:1px solid #e2e8f0;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-size:12px;cursor:pointer;}
 .lbtn{background:#fef3c7;color:#92400e;border:1px solid #fcd34d;border-radius:8px;padding:7px 12px;font-family:'Outfit',sans-serif;font-weight:600;font-size:12px;cursor:pointer;}
 .bstat{font-family:'DM Mono',monospace;font-size:11px;color:#10b981;background:#f0fdf4;border:1px solid #bbf7d0;padding:4px 9px;border-radius:8px;}
+.bstat-err{color:#dc2626 !important;background:#fef2f2 !important;border-color:#fca5a5 !important;}
 .goalbar{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;}
 .goalleft{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 .goallbl{font-size:12px;font-weight:600;color:#64748b;}
